@@ -193,7 +193,7 @@ For reranking runs we will add per-step `candidates`, `scores`, and `chosen_idx`
 
 ---
 
-## 8. Open team decisions
+## 9. Open team decisions
 
 1. Is the trajectory schema and pair schema OK for labeling and DPO?
 2. Thinking on or off for the main runs? (Speed vs. fewer loops.)

@@ -2,7 +2,7 @@
 """Validate trajectory records and create a manifest of rollout counts.
 
 Supports one trajectory per .json file or one trajectory per line in .jsonl/.ndjson.
-The required fields match the agreed Track 1 schema plus Track 2's additions.
+The required fields match the agreed schema.
 
 Usage:
     python validate_trajectories.py rollouts/v1
@@ -28,7 +28,7 @@ MATCHES_PATTERN = re.compile(r"^(\d+)/(\d+)$")
 
 TRAJECTORY_SCHEMA = {
     "name": "trajectory",
-    "version": "1.0",
+    "version": "1.1",
     "required_fields": {
         "traj_id": "non-empty string; unique",
         "task_id": "non-empty string",
@@ -46,7 +46,11 @@ TRAJECTORY_SCHEMA = {
         },
         "thinking": "boolean",
         "step_limit": "integer >= 1",
-        "versions": "object mapping names to versions",
+        "versions": {
+            "model_revision": "non-empty string (exact model revision)",
+            "chat_template_hash": "non-empty string (hash of chat template)",
+            "other_fields": "optional version strings"
+        },
         "finished_at": "ISO 8601 timestamp",
         "exit_status": "string or null",
         "steps": "integer >= 0",
@@ -56,7 +60,9 @@ TRAJECTORY_SCHEMA = {
         "patch": "string",
         "files_touched": "array of strings",
         "ref_patch_files": "array of strings",
-        "messages": "array of message objects"
+        "parent_traj_id": "non-empty string or null; null if not branched",
+        "branch_step": "integer >= 0 or null; null if not branched",
+        "messages": "verbatim raw mini-swe-agent history (array of message objects; do not truncate)"
     }
 }
 
@@ -123,12 +129,30 @@ def validate_trajectory(record: Any) -> tuple[list[str], list[str]]:
     if _is_int(steps) and _is_int(step_limit) and steps > step_limit:
         warnings.append("steps exceeds step_limit; check how steps are counted")
 
+    # A branch must identify both its parent and the point where it branched.
+    # Non-branched trajectories explicitly use null for both fields.
+    parent_traj_id = require("parent_traj_id", str, nullable=True)
+    branch_step = require("branch_step", int, nullable=True)
+    if (parent_traj_id is None) != (branch_step is None):
+        # If either is missing, require() already records the missing-field error.
+        if "parent_traj_id" in record and "branch_step" in record:
+            errors.append("parent_traj_id and branch_step: must both be null or both be set")
+    if _is_int(branch_step) and branch_step < 0:
+        errors.append("branch_step: must be >= 0")
+    if isinstance(parent_traj_id, str) and parent_traj_id == record.get("traj_id"):
+        errors.append("parent_traj_id: cannot equal traj_id")
+
     versions = require("versions", dict)
     if isinstance(versions, dict):
         for name, version in versions.items():
             if not isinstance(name, str) or not isinstance(version, str):
-                errors.append("versions: expected mapping of package name -> version string")
+                errors.append("versions: expected mapping of name -> version/hash string")
                 break
+        for field in ("model_revision", "chat_template_hash"):
+            if field not in versions:
+                errors.append(f"versions.{field}: missing required field")
+            elif not isinstance(versions[field], str) or not versions[field].strip():
+                errors.append(f"versions.{field}: expected non-empty string")
 
     ts = record.get("finished_at")
     if isinstance(ts, str) and ts.strip():

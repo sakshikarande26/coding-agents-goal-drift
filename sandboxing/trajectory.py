@@ -3,7 +3,6 @@ and the drift-indicator summary."""
 
 from __future__ import annotations
 
-import csv
 import json
 from pathlib import Path
 
@@ -113,14 +112,6 @@ def drift_indicators(traj: dict) -> dict:
     }
 
 
-def write_summary(trajs_dir: Path) -> list[dict]:
-    """One row per trajectory JSON in the folder (all runs so far, not just this call)."""
-    trajs = [json.loads(p.read_text()) for p in sorted(trajs_dir.glob("*.json"))]
-    rows = [drift_indicators(t) for t in trajs]
-    path = trajs_dir / "summary.csv"
-    if rows:
-        with open(path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-            writer.writeheader()
-            writer.writerows(rows)
-    return rows
+def summarize(trajs_dir: Path) -> list[dict]:
+    """Drift indicators for every trajectory JSON in the folder (printed, not saved)."""
+    return [drift_indicators(json.loads(p.read_text())) for p in sorted(trajs_dir.glob("*.json"))]

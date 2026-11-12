@@ -152,7 +152,7 @@ def cmd_run(cfg: Config) -> int:
     finally:
         server.stop(proc)
 
-    rows = trajectory.write_summary(cfg.trajs_dir) if cfg.trajs_dir.exists() else []
+    rows = trajectory.summarize(cfg.trajs_dir) if cfg.trajs_dir.exists() else []
     if rows:
         resolved = sum(r["resolved"] for r in rows)
         print(f"\nPass rate: {resolved}/{len(rows)}")

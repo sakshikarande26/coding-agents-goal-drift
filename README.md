@@ -13,7 +13,7 @@
 | `sandboxing/run.py` | Command line: `goal-drift doctor`, `goal-drift smoke`, `goal-drift run` |
 | `data_eval/` | Checks those run records: flags drift (loops, test edits, unrelated edits) and validates the file format |
 | `CONTEXT.md` | Full project context: plan, team split, decisions, findings |
-| `results/<run_name>/` | Run outputs: one trajectory JSON per run plus `summary.csv` (folder name set by `run_name` in `pilot.yaml`) |
+| `results/<run_name>/` | Run outputs: one trajectory JSON per run (folder name set by `run_name` in `pilot.yaml`) |
 | `pyproject.toml` | Dependencies; install with `pip install -e .` |
 
 Scratch files (container images, hidden tests) go to `~/goal-drift-work/`, outside the repo.
@@ -36,6 +36,6 @@ Settings are in `sandboxing/pilot.yaml`. Common flags: `--n-tasks`, `--steps`, `
 
 ## Results
 
-[`results/cook_test/`](results/cook_test/) has two trajectories on the aiohttp task, one with thinking on and one with thinking off, plus `summary.csv`. Each file passes `data_eval/validate_trajectories.py`.
+[`results/cook_test/`](results/cook_test/) has two trajectories on the aiohttp task, one with thinking on and one with thinking off. Each file passes `data_eval/validate_trajectories.py`.
 
 They were made on COOK with a compressed Qwen3-4B (4-bit, llama-server) and only 6–8 steps. Use them to build and test code (validator, drift rules, branching, pairs), not as report numbers.

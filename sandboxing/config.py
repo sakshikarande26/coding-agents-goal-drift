@@ -99,7 +99,7 @@ class Config:
 
     @property
     def trajs_dir(self) -> Path:
-        """Trajectory JSONs + summary.csv: results/<run_name>/ in the repo."""
+        """Trajectory JSONs: results/<run_name>/ in the repo."""
         return self.results_dir / self.run_name
 
     @property

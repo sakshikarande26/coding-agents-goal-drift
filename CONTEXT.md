@@ -2,7 +2,7 @@
 
 **Team:** Khoa Ho, Sakshi Karande, David Makarovsky
 **Course:** COMPSCI 690S AI Alignment, UMass Amherst
-**Last updated:** 2026-11-12 (day of the mid-project check-in)
+**Last updated:** 2026-11-12, evening (after the notebook moved to `sandboxing/`)
 
 ---
 
@@ -62,7 +62,7 @@ filter 20-80% + vLLM + sandbox   hand-check       DPO (LoRA)   RM, DPO          
 
 ## 5. Track 1: Infra and rollouts
 
-**Owners:** Sakshi (harness notebook, Colab), Khoa (Unity port and testing)
+**Owners:** Sakshi (harness, `sandboxing/`), Khoa (Unity port and testing)
 
 ### Built
 - **Sandbox, Colab:** udocker runs R2E-Gym Docker images without Docker. Smoke test on aiohttp task `fca11627`: buggy 13/14, gold fix 14/14.
@@ -72,6 +72,10 @@ filter 20-80% + vLLM + sandbox   hand-check       DPO (LoRA)   RM, DPO          
   - **v1** (`sandboxing.ipynb`): one task end to end.
   - **v2:** patch baseline fix, prompt fix, `Qwen3-4B-Instruct-2507`, repeat guard, gold-fix test-path fix, 5-task loop, summary table with drift indicators.
   - **v3** (`sandboxing_v3.ipynb`): `BACKEND` switch (udocker / apptainer), Khoa's flags, sandbox checks (section 6b), new schema fields.
+  - **Now: `sandboxing/` package** (replaces the notebooks, which are removed). Settings in `sandboxing/pilot.yaml`. Commands: `goal-drift doctor` (what this machine has), `goal-drift smoke` (sandbox + grading checks, no GPU), `goal-drift run` (rollouts). Flags: `--n-tasks`, `--steps`, `--no-thinking`, `--run-name`, `--server-url`.
+- **Backends:** `backend: auto` picks apptainer (Unity), else docker if it runs, else udocker (Colab, COOK). Docker path is untested.
+- **Outputs:** one trajectory JSON per run in `results/<run_name>/` (in the repo). Scratch (images, hidden tests, per-run copies) in `work_dir`, outside the repo.
+- **Sample trajectory:** `results/cook_dev/` (aiohttp task, thinking on, 30-step limit; stopped after 8 steps by the repeat guard, not resolved). Made with a 4-bit Qwen3-4B on COOK: for building code, not report numbers.
 
 ### Bugs found and fixed
 | Bug | Fix |
@@ -81,26 +85,26 @@ filter 20-80% + vLLM + sandbox   hand-check       DPO (LoRA)   RM, DPO          
 | `presence_penalty` did not stop loops | Repeat guard: stop after 5 identical failing commands (`RepeatedFailure`) |
 | Gold fix skipped any path containing "test" | Skip only files inside test folders |
 
-### Khoa's Unity wrapper requirements (all in v3)
+### Khoa's Unity wrapper requirements (all in `sandboxing/sandbox.py`)
 - `--pwd /testbed` (no chdir warnings in observations)
 - `--silent`
 - `--containall` (no host `$HOME`, `/tmp` or env vars such as `HF_TOKEN`)
 - `GIT_PAGER=cat`
-- Hidden tests, gold patches and trajectories kept under `WORK`, outside `$HOME`
+- Hidden tests, gold patches and trajectories kept under `WORK`, outside `$HOME` (with apptainer, the config refuses a `work_dir` inside `$HOME`)
 
-### Open (Sakshi, v4)
-1. **`finalize(traj)`:** fill and validate every required field before save, using the validator's names (top-level `model_revision`, `chat_template_hash`). Make `condition` an enum. Upgrade old v1 files.
-2. **Save the tools list:** the exact `bash` tool schema, plus its hash in `versions`.
-3. **Save all raw candidates per step** in `candidates_per_step`, with `messages[]` left as the exact DPO prompt.
-4. **Per-run container names and directories** (`r2e_<traj_id>`), with run state in a context object, so rollouts can run concurrently.
-5. **`THINKING` switch:** Qwen3-4B with thinking on (temp 0.6, top_p 0.95, top_k 20), thinking text saved verbatim.
-6. **`branch_from(traj, branch_step, k)`:** replay the prefix, check outputs against the saved observations, sample k next actions, save each branch with `parent_traj_id` and `branch_step`. Reuse Khoa's diversity script.
-
-Items 1, 2 and 4 can be built and tested on a CPU runtime. Items 3, 5 and 6 need one short GPU session.
+### Sakshi, v4 status
+1. **`finalize(traj)`:** done. Runs David's `validate_trajectory()` before every save and refuses invalid records. Allowed conditions are imported from `data_eval`. Both sample trajectories pass.
+2. **Save the tools list:** open.
+3. **Save all raw candidates per step** (`candidates_per_step`): open.
+4. **Per-run container names and directories** (`r2e_<traj_id>`, one `Sandbox` object per run): done. Two runs at once tested on COOK.
+5. **`THINKING` switch:** done (`thinking:` in `pilot.yaml` or `--no-thinking`; sampling preset per mode). With llama-server the thinking text is saved in each message's `reasoning_content`; with vLLM it may be inside `content`.
+6. **`branch_from(traj, branch_step, k)`:** open, next. Must pass David's prefix check (`data_eval/branching.py`). Reuse Khoa's diversity script.
+7. **Pilot** (4B vs 8B, thinking on vs off): open. Needs vLLM on Unity or Colab.
 
 ### Open (Khoa)
 - Pre-pull all SIFs in a CPU-only batch job, time a second image pull, clean `$B/apptainer_cache`, check the /work quota.
 - Test per-run overlays in place of 1.2 GB sandbox copies.
+- Run `goal-drift smoke --parallel 2` on Unity with `work_dir` on `/work` (the apptainer path of the new code is untested).
 - vLLM serve test with Qwen3-8B and the DPO length ladder (queued on Unity).
 
 ## 6. Track 2: Data and evaluation
@@ -150,7 +154,7 @@ ref_patch_files, files_touched, patch, tools, candidates_per_step, messages[]
 - `messages[]` is saved **untruncated**, including thinking and the exact observations (DPO needs the exact prompt and completions).
 - `files_touched` comes from the final patch. Files edited and then reverted are only visible in `messages[]`.
 - `split` is one of `train`, `heldout`, `verified`.
-- `condition` is an enum: `unguided`, `random_n`, `rule_filter`, `untrained_rm`, `rm_rerank`, `dpo`, `branch`.
+- `condition` is an enum. David's validator (the contract) allows `unguided`, `untrained_rm`, `rule_filter`, `rm_rerank`, `dpo`. **Open:** add `random_n` and `branch` (`branch_from()` needs `branch`).
 
 ## 9. Findings so far
 
@@ -160,6 +164,7 @@ ref_patch_files, files_touched, patch, tools, candidates_per_step, messages[]
    - Thinking off: 4–7 distinct commands at steps 0–1, then 1 distinct and 8/8 repeats from step 6. Temperature 1.0 does not help.
    - Thinking on: 2–8 distinct commands and no repeats at any step.
    - **Implication:** reranking needs candidate diversity, so thinking off gives the reward model nothing to choose between once the agent loops.
+4. **COOK cluster (CICS, 1080 Ti GPUs):** udocker runs R2E images without root (smoke test passes). Docker is not available, and singularity fails on Docker images (`/etc/hosts` permission denied). vLLM 0.33 does not run on the 1080 Ti (`cudaErrorNoKernelImageForDevice`), so COOK is for development only, with llama-server. Jobs are limited to 2 hours.
 
 ## 10. Decisions and changes from the proposal
 
@@ -186,7 +191,8 @@ ref_patch_files, files_touched, patch, tools, candidates_per_step, messages[]
 | When | Milestone |
 |---|---|
 | 11/12 | Mid-project check-in |
-| Next | v4 harness (finalize, tools, candidates, per-run names, thinking switch) |
+| Done 11/12 | `sandboxing/` package: finalize, per-run names, thinking switch, backends |
+| Next | v4 rest: tools list, candidates per step |
 | Next | `branch_from()`, then the 10-task pilot (4B vs 8B, thinking on vs off) |
 | Then | Pre-pull SIFs, pilot filter on ~150 train tasks |
 | Then | ~300 pairs, hand labels, kappa |
@@ -198,6 +204,8 @@ ref_patch_files, files_touched, patch, tools, candidates_per_step, messages[]
 
 - **Unity access for Sakshi and David:** Prof. Niekum's group (`pi_sniekum_umass_edu`) is in `superpod-a100`'s AllowAccounts. Ask him to add them to the group directly. HPC help: hpc@umass.edu.
 - **Khoa's branching script:** share it so `branch_from()` reuses it.
+- **Khoa:** test the new code on Unity (`goal-drift smoke --parallel 2`).
+- **David:** add `random_n` and `branch` to `CONDITIONS`?
 
 ## 14. Resources
 
@@ -221,15 +229,16 @@ ref_patch_files, files_touched, patch, tools, candidates_per_step, messages[]
 - mini-SWE-agent: https://github.com/SWE-agent/mini-swe-agent
 - R2E-Gym: https://github.com/R2E-Gym/R2E-Gym
 - vLLM (serving), TRL (`RewardTrainer`, `DPOTrainer`), PEFT (LoRA)
-- udocker (Docker images without Docker, Colab), Apptainer (Unity)
+- udocker (Docker images without Docker, Colab and COOK), Apptainer (Unity)
 - Models: `Qwen/Qwen3-4B`, `Qwen/Qwen3-4B-Instruct-2507`, `Qwen/Qwen3-8B`
 
 ### Team files
-- `sandboxing.ipynb` (v1), `sandboxing_v2.ipynb`, `sandboxing_v3.ipynb`
-- `traj_fca11627_seed0.json`: the first real trajectory (v1 schema, looped run)
+- `sandboxing/`: the harness (replaces the v1–v3 notebooks, still in git history)
+- `results/cook_dev/`: one sample trajectory in the current schema
 - Repo: `drift_rules`, `live_filter`, `offline_analysis`, schema validator (David)
 - Khoa's diversity test output (36-row CSV: step × temperature × thinking → distinct, no_action, same_as_prev)
 
 ### Compute
 - Colab free T4 (16 GB, fp16 only, no Docker)
 - Unity `gpu-preempt` L4 24 GB. `superpod-a100` via Prof. Niekum's group if access is granted
+- COOK (CICS) `gtx` partition, GTX 1080 Ti 11 GB, 2-hour jobs. No vLLM; development only (see Findings)

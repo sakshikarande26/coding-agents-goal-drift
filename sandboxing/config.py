@@ -13,6 +13,8 @@ import yaml
 # David's validator is the contract: take the allowed values from it, never copy them.
 from data_eval.validate_trajectories import CONDITIONS, SPLITS
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 BACKENDS = {"apptainer", "docker", "udocker"}
 SAMPLING_KEYS = {"temperature", "top_p", "presence_penalty"}  # required by David's validator
 
@@ -64,6 +66,8 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     apptainer_bin: str = "apptainer"
     cleanup_images: bool = True
+    results_dir: Path = Path("results")
+    run_name: str = "dev"
     dataset: str = "R2E-Gym/R2E-Gym-Lite"
     dataset_split: str = "train"
     n_tasks: int = 5
@@ -95,7 +99,8 @@ class Config:
 
     @property
     def trajs_dir(self) -> Path:
-        return self.work_dir / "trajs"
+        """Trajectory JSONs + summary.csv: results/<run_name>/ in the repo."""
+        return self.results_dir / self.run_name
 
     @property
     def runs_dir(self) -> Path:
@@ -149,6 +154,8 @@ def _validate(cfg: Config) -> None:
         problems.append("step_limit must be >= 1")
     if cfg.max_repeats < 0:
         problems.append("max_repeats must be >= 0 (0 = off)")
+    if not cfg.run_name or "/" in cfg.run_name:
+        problems.append("run_name must be a plain folder name, e.g. pilot_4b_think")
     if cfg.n_tasks < 1:
         problems.append("n_tasks must be >= 1")
     if problems:
@@ -158,11 +165,16 @@ def _validate(cfg: Config) -> None:
 def load_config(path: str | Path, **overrides: Any) -> Config:
     """Read a YAML file, apply command-line overrides, and check the result."""
     data = yaml.safe_load(Path(path).read_text()) or {}
+    server_url = overrides.pop("server_url", None)
     data.update({k: v for k, v in overrides.items() if v is not None})
     _check_keys(data, Config, str(path))
     server = data.pop("server", {}) or {}
+    if server_url:  # a server someone already started: use it, never start vLLM
+        server.update(url=server_url, start=False)
     _check_keys(server, ServerConfig, f"{path}: server")
     data["work_dir"] = Path(data.get("work_dir", "~/goal-drift-work")).expanduser().resolve()
+    results = Path(data.get("results_dir", "results")).expanduser()
+    data["results_dir"] = results if results.is_absolute() else (REPO_ROOT / results).resolve()
     if data.get("backend", "auto") == "auto":
         data["backend"] = detect_backend(data.get("apptainer_bin", "apptainer"))
     cfg = Config(server=ServerConfig(**server), **data)

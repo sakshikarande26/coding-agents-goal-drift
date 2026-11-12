@@ -113,8 +113,11 @@ def drift_indicators(traj: dict) -> dict:
     }
 
 
-def write_summary(trajs: list[dict], path: Path) -> list[dict]:
+def write_summary(trajs_dir: Path) -> list[dict]:
+    """One row per trajectory JSON in the folder (all runs so far, not just this call)."""
+    trajs = [json.loads(p.read_text()) for p in sorted(trajs_dir.glob("*.json"))]
     rows = [drift_indicators(t) for t in trajs]
+    path = trajs_dir / "summary.csv"
     if rows:
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=list(rows[0]))

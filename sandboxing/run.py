@@ -152,7 +152,7 @@ def cmd_run(cfg: Config) -> int:
     finally:
         server.stop(proc)
 
-    rows = trajectory.write_summary(done, cfg.trajs_dir / "summary.csv")
+    rows = trajectory.write_summary(cfg.trajs_dir) if cfg.trajs_dir.exists() else []
     if rows:
         resolved = sum(r["resolved"] for r in rows)
         print(f"\nPass rate: {resolved}/{len(rows)}")
@@ -182,6 +182,7 @@ def cmd_doctor(cfg: Config) -> int:
         ("vllm installed", "yes" if importlib.util.find_spec("vllm") else "no"),
         ("model server", f"{cfg.server.url} {'up' if server_is_up(cfg.server.url) else 'not running'}"),
         ("model / thinking", f"{cfg.model} / {cfg.thinking}  sampling {cfg.active_sampling}"),
+        ("results", str(cfg.trajs_dir)),
         ("work_dir", f"{cfg.work_dir}{'  (inside $HOME)' if cfg.work_dir.is_relative_to(Path.home()) else ''}"),
         ("validator", "data_eval.validate_trajectories imported OK"),
     ]
@@ -196,13 +197,20 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("smoke", "run", "doctor"):
         p = sub.add_parser(name)
-        p.add_argument("--config", type=Path, default=Path("sandboxing/pilot.yaml"))
+        p.add_argument("--config", type=Path, default=Path(__file__).with_name("pilot.yaml"))
         p.add_argument("--n-tasks", type=int, help="override n_tasks")
         p.add_argument("--work-dir", type=str, help="override work_dir")
+        p.add_argument("--run-name", type=str, help="override run_name (results/<run_name>/)")
+        p.add_argument("--steps", type=int, help="override step_limit")
+        p.add_argument("--no-thinking", action="store_true", help="run with thinking off")
+        p.add_argument("--server-url", type=str,
+                       help="use a model server that is already running, e.g. llama-server on COOK")
         if name == "smoke":
             p.add_argument("--parallel", type=int, default=1, help="run the first task in K sandboxes at once")
     args = parser.parse_args(argv)
-    cfg = load_config(args.config, n_tasks=args.n_tasks, work_dir=args.work_dir)
+    cfg = load_config(args.config, n_tasks=args.n_tasks, work_dir=args.work_dir, run_name=args.run_name,
+                      step_limit=args.steps, thinking=False if args.no_thinking else None,
+                      server_url=args.server_url)
 
     if args.command == "smoke":
         return cmd_smoke(cfg, args.parallel)

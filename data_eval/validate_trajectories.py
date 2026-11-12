@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Validate trajectory records and create a manifest of rollout counts.
+"""Validate Track 2 trajectory records and create a manifest of rollout counts.
 
 Supports one trajectory per .json file or one trajectory per line in .jsonl/.ndjson.
-The required fields match the agreed schema.
+The required fields match the agreed Track 1 schema plus Track 2's additions.
 
 Usage:
     python validate_trajectories.py rollouts/v1
@@ -17,6 +17,7 @@ import argparse
 from collections import Counter
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -37,7 +38,7 @@ MATCHES_PATTERN = re.compile(r"^(\d+)/(\d+)$")
 
 TRAJECTORY_SCHEMA = {
     "name": "trajectory",
-    "version": "1.2",
+    "version": "1.3-audited",
     "required_fields": {
         "traj_id": "non-empty string; unique",
         "task_id": "non-empty string",
@@ -62,7 +63,7 @@ TRAJECTORY_SCHEMA = {
         },
         "finished_at": "ISO 8601 timestamp",
         "exit_status": "string or null",
-        "steps": "integer >= 0",
+        "steps": "integer >= 0; counts all assistant messages, including no-tool-call or incomplete replies; may differ from branch_step",
         "resolved": "boolean",
         "tests_matched": "matched/total string",
         "test_summary": "string or object",
@@ -70,9 +71,11 @@ TRAJECTORY_SCHEMA = {
         "files_touched": "array of strings",
         "ref_patch_files": "array of strings",
         "parent_traj_id": "non-empty string or null; null if not branched",
-        "branch_step": "completed assistant+tool turns in shared parent prefix; integer >= 0 or null",
+        "branch_step": "completed assistant+matching-tool-response turns in shared parent prefix; integer >= 0 or null; differs from assistant-message count",
         "messages": "verbatim raw mini-swe-agent history (array of message objects; do not truncate)"
-    }
+    },
+    "optional_fields": {"prefix_message_count": "integer >= 0; exact end-exclusive prefix boundary when no-tool replies cause ambiguity",
+                        "decision_steps": "optional, provisional candidate/scores/chosen_idx logging; needs Track 1 contract"}
 }
 
 
@@ -81,7 +84,7 @@ def _is_int(value: Any) -> bool:
 
 
 def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def validate_trajectory(record: Any) -> tuple[list[str], list[str]]:
@@ -151,6 +154,10 @@ def validate_trajectory(record: Any) -> tuple[list[str], list[str]]:
             errors.append("parent_traj_id and branch_step: must both be null or both be set")
     if _is_int(branch_step) and branch_step < 0:
         errors.append("branch_step: must be >= 0")
+    if "prefix_message_count" in record and (not _is_int(record["prefix_message_count"]) or record["prefix_message_count"] < 0):
+        errors.append("prefix_message_count: expected integer >= 0")
+    if "prefix_message_count" in record and parent_traj_id is None:
+        errors.append("prefix_message_count: only valid for a branched trajectory")
     if isinstance(parent_traj_id, str) and parent_traj_id == record.get("traj_id"):
         errors.append("parent_traj_id: cannot equal traj_id")
 
@@ -169,7 +176,11 @@ def validate_trajectory(record: Any) -> tuple[list[str], list[str]]:
     ts = record.get("finished_at")
     if isinstance(ts, str) and ts.strip():
         try:
-            datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            parsed_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if "T" not in ts and " " not in ts:
+                errors.append("finished_at: expected timestamp with time, not date only")
+            if parsed_time.tzinfo is None:
+                warnings.append("finished_at: timezone missing; use UTC offset for reproducibility")
         except ValueError:
             errors.append("finished_at: expected ISO 8601 timestamp")
 
@@ -254,11 +265,22 @@ def validate_trajectory(record: Any) -> tuple[list[str], list[str]]:
                                 errors.append(f"messages[{i}].tool_calls[{j}].function.arguments.command: expected string")
             if role == "tool" and "content" not in message:
                 errors.append(f"messages[{i}].content: tool output missing")
+        # For non-branched trajectories, validate complete tool-call linkage.
+        # For branched histories, only inspect up through the branch prefix here:
+        # remaining history may contain recoverable model failures or partial runs.
+        try:
+            from .branching import completed_step_endpoints
+        except ImportError:
+            from branching import completed_step_endpoints
+        if parent_traj_id is None:
+            _, protocol_errors = completed_step_endpoints(messages)
+            for problem in protocol_errors:
+                warnings.append("message protocol: " + problem)
         if _is_int(steps) and assistant_count != steps:
             warnings.append(f"steps={steps} but found {assistant_count} assistant messages")
 
     if isinstance(messages, list) and _is_int(branch_step) and branch_step >= 0:
-        _, prefix_error = shared_prefix(messages, branch_step)
+        _, prefix_error = shared_prefix(messages, branch_step, prefix_message_count=record.get("prefix_message_count"))
         if prefix_error:
             errors.append("branch_step: " + prefix_error)
 
@@ -274,7 +296,20 @@ def collect_inputs(source: Path) -> list[Path]:
         raise FileNotFoundError(f"Input path not found: {source}")
     return sorted(p for p in source.rglob("*")
                   if p.is_file() and p.suffix.lower() in {".json", ".jsonl", ".ndjson"}
-                  and p.name != "manifest.json")
+                  and p.name not in {"manifest.json", "pair_manifest.json", "drift_flags.json", "filename_coverage.json"})
+
+
+def _strict_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate JSON key: {key}")
+        out[key] = value
+    return out
+
+
+def _no_nonfinite_constant(value: str) -> None:
+    raise ValueError(f"nonstandard JSON numeric constant: {value}")
 
 
 def iter_records(path: Path):
@@ -285,16 +320,18 @@ def iter_records(path: Path):
                 if not line.strip():
                     continue
                 try:
-                    yield f"{path}:{line_no}", json.loads(line), None
-                except json.JSONDecodeError as exc:
-                    yield f"{path}:{line_no}", None, f"invalid JSON: {exc.msg}"
+                    yield f"{path}:{line_no}", json.loads(line, object_pairs_hook=_strict_pairs,
+                                                                    parse_constant=_no_nonfinite_constant), None
+                except (json.JSONDecodeError, ValueError) as exc:
+                    yield f"{path}:{line_no}", None, f"invalid JSON: {exc}"
     else:
         try:
             with path.open("r", encoding="utf-8") as handle:
-                obj = json.load(handle)
+                obj = json.load(handle, object_pairs_hook=_strict_pairs,
+                                parse_constant=_no_nonfinite_constant)
             yield str(path), obj, None
-        except json.JSONDecodeError as exc:
-            yield str(path), None, f"invalid JSON: {exc.msg} (line {exc.lineno})"
+        except (json.JSONDecodeError, ValueError) as exc:
+            yield str(path), None, f"invalid JSON: {exc}"
 
 
 def create_manifest(source: Path, *, allow_missing_parents: bool = False) -> dict:
@@ -351,8 +388,9 @@ def create_manifest(source: Path, *, allow_missing_parents: bool = False) -> dic
         for field in ("task_id", "split"):
             if rec.get(field) != parent.get(field):
                 entry["errors"].append(f"{field}: branch differs from parent")
-        parent_prefix, perr = shared_prefix(parent.get("messages"), branch_step)
-        child_prefix, cerr = shared_prefix(rec.get("messages"), branch_step)
+        prefix_count = rec.get("prefix_message_count")
+        parent_prefix, perr = shared_prefix(parent.get("messages"), branch_step, prefix_message_count=prefix_count)
+        child_prefix, cerr = shared_prefix(rec.get("messages"), branch_step, prefix_message_count=prefix_count)
         if perr:
             entry["errors"].append(f"parent prefix: {perr}")
         if cerr:

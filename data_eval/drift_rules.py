@@ -20,6 +20,7 @@ separate derived view. Python 3.9+ and standard library only.
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 import re
 from typing import Any, Optional
@@ -66,11 +67,30 @@ PYTHON_WRITE_RE = re.compile(
     r"open\s*\([^\n]*?,\s*['\"][wax]['\"])",
     re.IGNORECASE,
 )
+SOURCE_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".rb", ".c", ".cpp"}
+
 PATCH_PATH_RE = re.compile(
     r"^(?:\*\*\* (?:Add|Update|Delete) File: |diff --git a/|\+\+\+ b/)([^\n]+)$",
     re.MULTILINE,
 )
 
+
+
+def issue_from_record(record: dict[str, Any]) -> str:
+    """Use the agreed problem_statement, or extract [ISSUE] from old logs.
+
+    Never treat the harness instruction block as task content. A missing
+    description means filename-based rules have insufficient context.
+    """
+    issue = record.get("problem_statement")
+    if isinstance(issue, str) and issue.strip():
+        return issue
+    for m in record.get("messages", []):
+        if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str):
+            match = re.search(r"\[ISSUE\](.*?)\[/ISSUE\]", m["content"], re.S)
+            if match:
+                return match.group(1)
+    return ""
 
 def _normalize_command(command: str) -> str:
     """Normalize whitespace only for comparison; never alter stored history."""
@@ -109,53 +129,88 @@ def _command_from_call(call: Any) -> Optional[str]:
     return None
 
 
-def extract_steps(messages: Any) -> list[dict[str, Any]]:
-    """Extract executed (command, observation) pairs from raw message history.
+def extract_steps_with_issues(messages: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    """Parse executed commands without guessing unmatched tool replies.
 
-    Matches tool outputs to tool calls by tool_call_id where available;
-    otherwise pairs with the earliest unmatched command. This derived view
-    is deliberately separate from the authoritative raw messages[].
+    A tool output with an unknown ID is NOT assigned to some other command.
+    Synthetic error feedback after a no-tool-call assistant is ignored for
+    command extraction; it is still retained in the original messages[].
     """
     if not isinstance(messages, list):
-        return []
+        return [], ["messages: expected list"]
     steps: list[dict[str, Any]] = []
-    pending_by_id: dict[str, int] = {}
-    unmatched_indices: list[int] = []
-
-    for message in messages:
-        if not isinstance(message, dict):
+    issues: list[str] = []
+    pending: dict[str, int] = {}
+    idless: list[int] = []
+    no_call_feedback_possible = False
+    for msg_idx, m in enumerate(messages):
+        if not isinstance(m, dict):
+            issues.append(f"messages[{msg_idx}]: expected object")
             continue
-        role = message.get("role")
+        role = m.get("role")
         if role == "assistant":
-            for call in message.get("tool_calls") or []:
+            if pending or idless:
+                issues.append(f"messages[{msg_idx}]: previous tool calls have no matching output")
+                pending.clear()
+                idless.clear()
+            calls = m.get("tool_calls")
+            no_call_feedback_possible = not calls
+            if calls is None or calls == []:
+                continue
+            if not isinstance(calls, list):
+                issues.append(f"messages[{msg_idx}].tool_calls: expected list")
+                continue
+            for call_idx, call in enumerate(calls):
                 command = _command_from_call(call)
                 if command is None:
+                    issues.append(f"messages[{msg_idx}].tool_calls[{call_idx}]: unreadable command")
                     continue
-                step_index = len(steps)
-                entry = {
-                    "step": step_index + 1,
-                    "command": command,
-                    "observation": None,
-                }
-                steps.append(entry)
-                unmatched_indices.append(step_index)
-                call_id = call.get("id") if isinstance(call, dict) else None
-                if isinstance(call_id, str):
-                    pending_by_id[call_id] = step_index
+                ident = call.get("id") if isinstance(call, dict) else None
+                entry_idx = len(steps)
+                steps.append({"step": entry_idx + 1, "command": command,
+                              "observation": None, "returncode": None,
+                              "assistant_message_index": msg_idx,
+                              "observation_message_index": None})
+                if isinstance(ident, str) and ident:
+                    if ident in pending:
+                        issues.append(f"messages[{msg_idx}]: duplicate tool_call_id {ident!r}")
+                    pending[ident] = entry_idx
+                else:
+                    idless.append(entry_idx)
         elif role == "tool":
-            call_id = message.get("tool_call_id")
-            matched_idx = pending_by_id.pop(call_id, None) if isinstance(call_id, str) else None
-            if matched_idx is None:
-                matched_idx = next(
-                    (i for i in unmatched_indices if steps[i]["observation"] is None), None
-                )
-            if matched_idx is not None:
-                steps[matched_idx]["observation"] = _observation_text(message.get("content"))
-                if matched_idx in unmatched_indices:
-                    unmatched_indices.remove(matched_idx)
-                for key, index in list(pending_by_id.items()):
-                    if index == matched_idx:
-                        pending_by_id.pop(key, None)
+            ident = m.get("tool_call_id")
+            if no_call_feedback_possible and not ident and not pending and not idless:
+                no_call_feedback_possible = False
+                continue
+            if isinstance(ident, str) and ident:
+                matched_idx = pending.pop(ident, None)
+                if matched_idx is None:
+                    issues.append(f"messages[{msg_idx}]: unmatched tool_call_id {ident!r}")
+                    continue
+            elif pending:
+                issues.append(f"messages[{msg_idx}]: missing tool_call_id for identified pending command")
+                continue
+            elif idless:
+                matched_idx = idless.pop(0)
+            else:
+                issues.append(f"messages[{msg_idx}]: orphan tool response")
+                continue
+            steps[matched_idx]["observation"] = _observation_text(m.get("content"))
+            steps[matched_idx]["observation_message_index"] = msg_idx
+            extra = m.get("extra")
+            if isinstance(extra, dict) and type(extra.get("returncode")) is int:
+                steps[matched_idx]["returncode"] = extra["returncode"]
+            no_call_feedback_possible = False
+        else:
+            no_call_feedback_possible = False
+    if pending or idless:
+        issues.append(f"{len(pending) + len(idless)} command(s) lack tool responses")
+    return steps, issues
+
+
+def extract_steps(messages: Any) -> list[dict[str, Any]]:
+    """Backward-compatible derived view; prefer extract_steps_with_issues for audits."""
+    steps, _issues = extract_steps_with_issues(messages)
     return steps
 
 
@@ -182,7 +237,12 @@ def detect_loop(
     if any(_normalize_command(s.get("command", "")) != cmd for s in recent):
         return None
     observations = [_normalize_observation(s.get("observation")) for s in recent]
-    if not all(observations) or len(set(observations)) != 1 or not _failure(observations[0]):
+    if not all(observations) or len(set(observations)) != 1:
+        return None
+    failed = _failure(observations[0]) or all(
+        type(s.get("returncode")) is int and s["returncode"] != 0 for s in recent
+    )
+    if not failed:
         return None
     return {
         "drift_type": "loop",
@@ -204,39 +264,57 @@ def _clean_path(path: str) -> str:
     return path.replace("\\", "/")
 
 
-def _edited_paths(command: str) -> list[str]:
-    """Conservatively infer modified paths from common shell/patch patterns.
+def _shell_clauses(command: str) -> list[list[str]]:
+    """Best-effort split on shell control tokens, without executing commands."""
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return [[command]]  # opaque command; may yield conservative false positives
+    clauses: list[list[str]] = [[]]
+    for token in tokens:
+        if token and all(c in ";&|" for c in token):
+            clauses.append([])
+        else:
+            clauses[-1].append(token)
+    return [clause for clause in clauses if clause]
 
-    Not a full shell parser; opaque Python commands and indirect writes may
-    escape detection. Read-only commands (cat/grep/pytest/sed without -i) are
-    intentionally ignored.
-    """
+
+def _edited_paths(command: str) -> list[str]:
+    """Heuristically identify write targets; never infer certainty from this."""
     if not isinstance(command, str):
         return []
     paths: set[str] = set()
-
-    # Applied patch formats; discard placeholders /dev/null and old a/ paths.
-    for m in PATCH_PATH_RE.finditer(command):
-        raw = m.group(1)
+    for match in PATCH_PATH_RE.finditer(command):
+        raw = match.group(1)
         if raw.startswith("a/") and " b/" in raw:
             raw = raw.split(" b/", 1)[1]
         path = _clean_path(raw)
         if path and path != "/dev/null":
             paths.add(path)
-
-    # Shell output redirection to a file, e.g. cat > tests/test_router.py.
-    for m in REDIRECT_RE.finditer(command):
-        raw = _clean_path(m.group(1))
-        if raw and raw not in {"/dev/null", "&1", "&2"}:
-            paths.add(raw)
-
-    # Strong indicator: an editing command naming one or more file paths.
-    # Excludes read-only commands, even if their arguments include test paths.
-    if EDITING_COMMAND_RE.search(command) or PYTHON_WRITE_RE.search(command):
-        for m in PATH_RE.finditer(command):
-            paths.add(_clean_path(m.group(0)))
-
-    # Python Path(...).write_text()/write_bytes() is covered above by PYTHON_WRITE_RE.
+    for match in REDIRECT_RE.finditer(command):
+        path = _clean_path(match.group(1))
+        if path and path not in {"/dev/null", "&1", "&2"}:
+            paths.add(path)
+    for clause in _shell_clauses(command):
+        text = " ".join(clause)
+        if not (EDITING_COMMAND_RE.search(text) or PYTHON_WRITE_RE.search(text)):
+            continue
+        # cp reads its source; only the destination is changed. mv modifies
+        # both source (removal) and destination (creation).
+        first = clause[0].lower() if clause else ""
+        if first == "cp":
+            targets = [clause[-1]] if len(clause) >= 3 else []
+        else:
+            targets = clause
+        for token in targets:
+            # sed substitution scripts contain arbitrary file-like text but
+            # are NOT themselves path arguments.
+            if token.startswith(("s/", "s#", "s|")):
+                continue
+            for match in PATH_RE.finditer(token):
+                paths.add(_clean_path(match.group(0)))
     return sorted(paths)
 
 
@@ -267,13 +345,14 @@ def detect_unrelated_edit(command: str, problem_statement: str = "") -> Optional
     patch and must NEVER be treated as a definitive drift classification.
     """
     explicit_paths = [_clean_path(m.group(0)) for m in PATH_RE.finditer(problem_statement or "")]
-    explicit_names = {Path(p).name.lower() for p in explicit_paths if not _is_test_path(p)}
+    explicit_names = {Path(p).name.lower() for p in explicit_paths
+                      if not _is_test_path(p) and Path(p).suffix.lower() in SOURCE_SUFFIXES}
     if not explicit_names:
         return None
     candidates = [
         p for p in _edited_paths(command)
         if Path(p).name.lower() not in explicit_names and not _is_test_path(p)
-        and Path(p).suffix.lower() in {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".rb", ".c", ".cpp"}
+        and Path(p).suffix.lower() in SOURCE_SUFFIXES
     ]
     if not candidates:
         return None

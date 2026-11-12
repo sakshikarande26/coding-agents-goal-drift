@@ -22,13 +22,22 @@ import re
 import sys
 from typing import Any
 
+try:
+    from .branching import shared_prefix
+except ImportError:
+    from branching import shared_prefix
+
+# Provisional names based on the five conditions in the project plan.
+# Sakshi / Khoa should confirm these exact strings before production runs.
+CONDITIONS = {"unguided", "untrained_rm", "rule_filter", "rm_rerank", "dpo"}
+
 
 SPLITS = {"train", "heldout", "verified"}
 MATCHES_PATTERN = re.compile(r"^(\d+)/(\d+)$")
 
 TRAJECTORY_SCHEMA = {
     "name": "trajectory",
-    "version": "1.1",
+    "version": "1.2",
     "required_fields": {
         "traj_id": "non-empty string; unique",
         "task_id": "non-empty string",
@@ -36,7 +45,7 @@ TRAJECTORY_SCHEMA = {
         "repo": "non-empty string",
         "docker_image": "non-empty string",
         "problem_statement": "non-empty string",
-        "condition": "non-empty string",
+        "condition": "one of: unguided, untrained_rm, rule_filter, rm_rerank, dpo",
         "model": "non-empty string",
         "sampling": {
             "temperature": "number >= 0",
@@ -61,7 +70,7 @@ TRAJECTORY_SCHEMA = {
         "files_touched": "array of strings",
         "ref_patch_files": "array of strings",
         "parent_traj_id": "non-empty string or null; null if not branched",
-        "branch_step": "integer >= 0 or null; null if not branched",
+        "branch_step": "completed assistant+tool turns in shared parent prefix; integer >= 0 or null",
         "messages": "verbatim raw mini-swe-agent history (array of message objects; do not truncate)"
     }
 }
@@ -110,6 +119,9 @@ def validate_trajectory(record: Any) -> tuple[list[str], list[str]]:
         "model", "problem_statement", "finished_at",
     ):
         require(field, str)
+
+    if isinstance(record.get("condition"), str) and record["condition"] not in CONDITIONS:
+        errors.append(f"condition: must be one of {sorted(CONDITIONS)}")
 
     split = require("split", str)
     if isinstance(split, str) and split not in SPLITS:
@@ -245,6 +257,11 @@ def validate_trajectory(record: Any) -> tuple[list[str], list[str]]:
         if _is_int(steps) and assistant_count != steps:
             warnings.append(f"steps={steps} but found {assistant_count} assistant messages")
 
+    if isinstance(messages, list) and _is_int(branch_step) and branch_step >= 0:
+        _, prefix_error = shared_prefix(messages, branch_step)
+        if prefix_error:
+            errors.append("branch_step: " + prefix_error)
+
     # Additional per-decision data (candidates/scores/chosen_idx) is allowed,
     # but not required until the team finalizes reranking log structure.
     return errors, warnings
@@ -280,46 +297,90 @@ def iter_records(path: Path):
             yield str(path), None, f"invalid JSON: {exc.msg} (line {exc.lineno})"
 
 
-def create_manifest(source: Path) -> dict:
+def create_manifest(source: Path, *, allow_missing_parents: bool = False) -> dict:
+    """Validate local fields, then cross-check branch history against parent.
+
+    To validate branches, supply the directory with BOTH parent and branch.
+    If a parent is absent, default to an error; partial batches may opt into
+    a warning with allow_missing_parents=True.
+    """
     files = collect_inputs(source)
     counters = {name: Counter() for name in ("split", "condition", "model", "seed", "exit_status")}
     issues = []
-    seen_ids: dict[str, str] = {}
+    records: list[dict] = []
     unique_tasks: set[str] = set()
-    n_records = n_valid = n_invalid = n_warnings = 0
 
     for path in files:
         try:
             for location, record, parse_error in iter_records(path):
-                n_records += 1
-                errors, warnings = ([parse_error], []) if parse_error else validate_trajectory(record)
-                traj_id = record.get("traj_id") if isinstance(record, dict) else None
-                task_id = record.get("task_id") if isinstance(record, dict) else None
-                if isinstance(traj_id, str) and traj_id.strip():
-                    if traj_id in seen_ids:
-                        errors.append(f"traj_id: duplicate of record in {seen_ids[traj_id]}")
-                    else:
-                        seen_ids[traj_id] = location
-
-                if errors:
-                    n_invalid += 1
-                else:
-                    n_valid += 1
-                    unique_tasks.add(record["task_id"])
-                    for name in ("split", "condition", "model"):
-                        counters[name][record[name]] += 1
-                    counters["seed"][str(record["sampling"]["seed"])] += 1
-                    counters["exit_status"][str(record["exit_status"])] += 1
-
-                n_warnings += len(warnings)
-                if errors or warnings:
-                    issues.append({"location": location, "traj_id": traj_id,
-                                   "task_id": task_id, "errors": errors, "warnings": warnings})
+                errs, warns = ([parse_error], []) if parse_error else validate_trajectory(record)
+                records.append({"location": location, "record": record, "errors": errs, "warnings": warns})
         except (OSError, UnicodeError) as exc:
+            records.append({"location": str(path), "record": None,
+                            "errors": [f"Could not read file: {exc}"], "warnings": []})
+
+    by_id: dict[str, dict] = {}
+    for entry in records:
+        rec = entry["record"]
+        if not isinstance(rec, dict):
+            continue
+        ident = rec.get("traj_id")
+        if isinstance(ident, str) and ident.strip():
+            if ident in by_id:
+                entry["errors"].append(f"traj_id: duplicate of {by_id[ident]['location']}")
+            else:
+                by_id[ident] = entry
+
+    for entry in records:
+        rec = entry["record"]
+        if not isinstance(rec, dict):
+            continue
+        parent_id = rec.get("parent_traj_id")
+        branch_step = rec.get("branch_step")
+        if not isinstance(parent_id, str) or not parent_id.strip() or not _is_int(branch_step) or branch_step < 0:
+            continue
+        parent_entry = by_id.get(parent_id)
+        if parent_entry is None:
+            message = f"parent_traj_id: {parent_id!r} not found in provided trajectories; cannot validate shared prefix"
+            (entry["warnings"] if allow_missing_parents else entry["errors"]).append(message)
+            continue
+        parent = parent_entry["record"]
+        if not isinstance(parent, dict):
+            entry["errors"].append("parent_traj_id: parent record is not an object")
+            continue
+        for field in ("task_id", "split"):
+            if rec.get(field) != parent.get(field):
+                entry["errors"].append(f"{field}: branch differs from parent")
+        parent_prefix, perr = shared_prefix(parent.get("messages"), branch_step)
+        child_prefix, cerr = shared_prefix(rec.get("messages"), branch_step)
+        if perr:
+            entry["errors"].append(f"parent prefix: {perr}")
+        if cerr:
+            entry["errors"].append(f"branch prefix: {cerr}")
+        if perr is None and cerr is None and parent_prefix != child_prefix:
+            entry["errors"].append(
+                "branch prefix: messages[] differs from parent's first "
+                f"{branch_step} completed assistant+tool pairs (including initial context)"
+            )
+
+    n_valid = n_invalid = n_warnings = 0
+    for entry in records:
+        errors, warnings, rec = entry["errors"], entry["warnings"], entry["record"]
+        if errors:
             n_invalid += 1
-            n_records += 1
-            issues.append({"location": str(path), "traj_id": None, "task_id": None,
-                           "errors": [f"Could not read file: {exc}"], "warnings": []})
+        else:
+            n_valid += 1
+            unique_tasks.add(rec["task_id"])
+            for name in ("split", "condition", "model"):
+                counters[name][rec[name]] += 1
+            counters["seed"][str(rec["sampling"]["seed"])] += 1
+            counters["exit_status"][str(rec["exit_status"])] += 1
+        n_warnings += len(warnings)
+        if errors or warnings:
+            issues.append({"location": entry["location"],
+                           "traj_id": rec.get("traj_id") if isinstance(rec, dict) else None,
+                           "task_id": rec.get("task_id") if isinstance(rec, dict) else None,
+                           "errors": errors, "warnings": warnings})
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -327,7 +388,7 @@ def create_manifest(source: Path) -> dict:
         "schema": TRAJECTORY_SCHEMA,
         "counts": {
             "files_scanned": len(files),
-            "records_scanned": n_records,
+            "records_scanned": len(records),
             "valid_trajectories": n_valid,
             "invalid_trajectories": n_invalid,
             "unique_valid_tasks": len(unique_tasks),
@@ -347,9 +408,11 @@ def main() -> int:
     parser.add_argument("input", type=Path, help="Trajectory .json/.jsonl file or a folder")
     parser.add_argument("--manifest", type=Path, default=None,
                         help="Where to write manifest.json (default: inside input folder)")
+    parser.add_argument("--allow-missing-parents", action="store_true",
+                        help="Warn instead of error when a branch's parent is outside the input batch")
     args = parser.parse_args()
     try:
-        manifest = create_manifest(args.input)
+        manifest = create_manifest(args.input, allow_missing_parents=args.allow_missing_parents)
     except FileNotFoundError as exc:
         parser.error(str(exc))
 

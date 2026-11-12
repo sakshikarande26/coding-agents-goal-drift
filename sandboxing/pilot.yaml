@@ -1,0 +1,43 @@
+# Pilot run settings (was notebook section 2).
+# Copy this file to try other settings, e.g. sandboxing/pilot_8b.yaml.
+
+# --- Sandbox ---
+backend: auto               # auto = apptainer if installed (Unity), else docker if it runs, else udocker (Colab, COOK)
+apptainer_bin: apptainer    # use "singularity" on clusters that only have the old name
+# Run outputs (trajectories, container images, hidden tests) go here, outside the repo.
+# The agent must never see this folder. On Unity use a /work path (apptainer refuses $HOME).
+work_dir: ~/goal-drift-work
+cleanup_images: true        # delete each task's image after its runs (saves disk on Colab).
+                            # Set false on Unity, where images are pre-pulled and shared.
+
+# --- Model ---
+model: Qwen/Qwen3-4B        # hybrid model: thinking can be on or off
+thinking: true              # Khoa's diversity test: thinking on keeps candidate commands diverse
+# Qwen's recommended settings per mode. The run uses the one that matches `thinking`.
+sampling:
+  thinking_on:  {temperature: 0.6, top_p: 0.95, top_k: 20, presence_penalty: 1.5}
+  thinking_off: {temperature: 0.7, top_p: 0.8,  top_k: 20, presence_penalty: 1.5}
+
+# --- Model server ---
+server:
+  start: true               # false = use a server that is already running at `url`
+  url: http://localhost:8000/v1
+  dtype: half               # half on T4, bfloat16 on L4/A100
+  max_model_len: 16384      # thinking uses more tokens; raise to 32768 if runs hit the limit
+  gpu_memory_utilization: 0.85
+  startup_timeout: 900      # seconds
+
+# --- Tasks ---
+dataset: R2E-Gym/R2E-Gym-Lite
+dataset_split: train
+n_tasks: 5
+max_per_repo: 2             # keep some repo variety
+max_non_test_files: 1       # small fixes only
+max_non_test_lines: 10
+
+# --- Runs ---
+seeds: [0]
+step_limit: 30
+max_repeats: 5              # stop after this many identical failing commands in a row (0 = off)
+condition: unguided         # allowed values come from data_eval/validate_trajectories.py (CONDITIONS)
+split: train                # train | heldout | verified

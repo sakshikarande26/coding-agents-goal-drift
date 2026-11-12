@@ -8,6 +8,8 @@ From project root:
 No external Python packages. The pair contract is v0/provisional: coordinate
 exact chosen/rejected representation and drift_type labels with Track 3.
 """
+from __future__ import annotations
+
 import argparse
 from collections import Counter
 from datetime import datetime, timezone
@@ -28,7 +30,7 @@ LABEL_SOURCES = {"auto", "human"}
 
 PAIR_SCHEMA = {
     "name": "preference_pair",
-    "version": "0.1-proposed",
+    "version": "0.2-audited-provisional",
     "required_fields": {
         "pair_id": "non-empty string; unique in batch",
         "task_id": "non-empty string",
@@ -41,7 +43,9 @@ PAIR_SCHEMA = {
         "drift_type": "one of six project drift types or 'none'",
         "split": "train, heldout, verified",
     },
-    "optional_fields": {"chosen_idx": "integer >= 0", "rejected_idx": "integer >= 0"}
+    "optional_fields": {"chosen_idx": "integer >= 0", "rejected_idx": "integer >= 0",
+                        "prefix_message_count": "integer >= 0; disambiguates prefixes after no-tool responses",
+                        "chosen_traj_id": "optional string for provenance", "rejected_traj_id": "optional string for provenance"}
 }
 
 
@@ -83,18 +87,58 @@ def validate_pair(pair: Any) -> list[str]:
         errors.append(f"drift_type: must be one of {sorted(DRIFT_TYPES | {'none'})}")
     if pair.get("split") not in SPLITS:
         errors.append(f"split: must be one of {sorted(SPLITS)}")
+    if "prefix_message_count" in pair and (type(pair["prefix_message_count"]) is not int or pair["prefix_message_count"] < 0):
+        errors.append("prefix_message_count: expected integer >= 0")
+    for f in ("chosen_traj_id", "rejected_traj_id"):
+        if f in pair and (not isinstance(pair[f], str) or not pair[f].strip()):
+            errors.append(f"{f}: expected nonempty string")
     for f in ("chosen_idx", "rejected_idx"):
         if f in pair and (type(pair[f]) is not int or pair[f] < 0):
             errors.append(f"{f}: expected integer >= 0")
+    if ("chosen_idx" in pair) != ("rejected_idx" in pair):
+        errors.append("chosen_idx and rejected_idx: supply both or neither")
     if ("chosen_idx" in pair and "rejected_idx" in pair and
             pair["chosen_idx"] == pair["rejected_idx"]):
         errors.append("chosen_idx and rejected_idx: must differ")
     return errors
 
 
+def _first_command(value: Any) -> str | None:
+    """Compare action choices ignoring incidental tool-call IDs."""
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        calls = value.get("tool_calls")
+        if not isinstance(calls, list) or len(calls) != 1:
+            return None
+        call = calls[0]
+        if not isinstance(call, dict) or not isinstance(call.get("function"), dict):
+            return None
+        args = call["function"].get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                return None
+        if isinstance(args, dict) and isinstance(args.get("command"), str):
+            return args["command"].strip()
+    return None
+
+
+def pair_warnings(pair: Any) -> list[str]:
+    if not isinstance(pair, dict):
+        return []
+    a, b = _first_command(pair.get("chosen")), _first_command(pair.get("rejected"))
+    if a and b and a == b:
+        return ["chosen and rejected execute the same command; only text/tool metadata differs"]
+    return []
+
+
 def load_parent_map(source: Path) -> dict[str, dict]:
     by_id: dict[str, dict] = {}
     for path in collect_inputs(source):
+        if path.name in {"pair_manifest.json", "drift_flags.json"}:
+            continue
         for location, record, parse_err in iter_records(path):
             if parse_err:
                 raise ValueError(f"{location}: {parse_err}")
@@ -120,6 +164,7 @@ def validate_pairs(source: Path, *, trajectories: Path | None = None) -> dict:
             for location, rec, parse_error in iter_records(path):
                 counts["records_scanned"] += 1
                 errors = [parse_error] if parse_error else validate_pair(rec)
+                warnings = [] if parse_error else pair_warnings(rec)
                 if isinstance(rec, dict):
                     ident = rec.get("pair_id")
                     if isinstance(ident, str) and ident.strip():
@@ -137,19 +182,22 @@ def validate_pairs(source: Path, *, trajectories: Path | None = None) -> dict:
                             if rec.get("split") != parent.get("split"):
                                 errors.append("split: does not match parent trajectory")
                             if type(rec.get("prefix_len")) is int and rec["prefix_len"] >= 0:
-                                expected, err = shared_prefix(parent.get("messages"), rec["prefix_len"])
+                                expected, err = shared_prefix(parent.get("messages"), rec["prefix_len"],
+                                                              prefix_message_count=rec.get("prefix_message_count"))
                                 if err:
                                     errors.append(f"parent prompt prefix: {err}")
                                 elif rec.get("prompt_messages") != expected:
                                     errors.append("prompt_messages: not the exact parent history at prefix_len")
                 if errors:
                     counts["invalid_pairs"] += 1
-                    issues.append({"location": location, "pair_id": rec.get("pair_id") if isinstance(rec, dict) else None,
-                                   "errors": errors})
                 else:
                     counts["valid_pairs"] += 1
                     types[rec["drift_type"]] += 1
                     splits[rec["split"]] += 1
+                counts["warnings"] += len(warnings)
+                if errors or warnings:
+                    issues.append({"location": location, "pair_id": rec.get("pair_id") if isinstance(rec, dict) else None,
+                                   "errors": errors, "warnings": warnings})
         except (UnicodeError, OSError) as exc:
             counts["records_scanned"] += 1
             counts["invalid_pairs"] += 1
@@ -160,7 +208,8 @@ def validate_pairs(source: Path, *, trajectories: Path | None = None) -> dict:
         "trajectory_source": str(trajectories) if trajectories else None,
         "schema": PAIR_SCHEMA,
         "counts": {"files_scanned": len(files), "records_scanned": counts["records_scanned"],
-                   "valid_pairs": counts["valid_pairs"], "invalid_pairs": counts["invalid_pairs"]},
+                   "valid_pairs": counts["valid_pairs"], "invalid_pairs": counts["invalid_pairs"],
+                   "warnings": counts["warnings"]},
         "valid_by_drift_type": dict(sorted(types.items())),
         "valid_by_split": dict(sorted(splits.items())),
         "issues": issues,
@@ -186,6 +235,8 @@ def main() -> int:
         print(issue["location"])
         for error in issue["errors"]:
             print("  ERROR:", error)
+        for warning in issue.get("warnings", []):
+            print("  WARNING:", warning)
     print("Manifest saved to:", out)
     return 1 if report["counts"]["invalid_pairs"] else 0
 

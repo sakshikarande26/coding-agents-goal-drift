@@ -2,9 +2,9 @@
 """Offline analysis of completed coding-agent trajectories.
 
 Usage from repository root:
-    python evaluation/offline_analysis.py --demo
-    python evaluation/offline_analysis.py examples/stand_in_trajectory.json
-    python evaluation/offline_analysis.py rollouts/v1/ --output drift_flags.json
+    python data_eval/offline_analysis.py --demo
+    python data_eval/offline_analysis.py examples/stand_in_trajectory.json
+    python data_eval/offline_analysis.py rollouts/v1/ --output drift_flags.json
 
 Reads individual JSON trajectories or directories of JSON/JSONL/NDJSON records.
 For each executed command, tests the rules against only its preceding history;
@@ -23,9 +23,9 @@ from pathlib import Path
 from typing import Any, Iterator
 
 if __package__:
-    from .drift_rules import evaluate_candidate, extract_steps
+    from .drift_rules import evaluate_candidate, extract_steps_with_issues, issue_from_record
 else:
-    from drift_rules import evaluate_candidate, extract_steps
+    from drift_rules import evaluate_candidate, extract_steps_with_issues, issue_from_record
 
 
 def analyze_trajectory(record: dict[str, Any]) -> dict[str, Any]:
@@ -35,16 +35,23 @@ def analyze_trajectory(record: dict[str, Any]) -> dict[str, Any]:
     messages = record.get("messages")
     if not isinstance(messages, list):
         raise ValueError("trajectory must contain messages[]")
-    issue = record.get("problem_statement", "")
-    if not isinstance(issue, str):
-        raise ValueError("problem_statement must be a string")
+    issue = issue_from_record(record)
 
-    steps = extract_steps(messages)
+    steps, parse_issues = extract_steps_with_issues(messages)
+    no_tool_call_count = sum(1 for m in messages if isinstance(m, dict) and
+                             m.get("role") == "assistant" and not m.get("tool_calls"))
     flagged_steps: list[dict[str, Any]] = []
     by_type: Counter[str] = Counter()
     for i, step in enumerate(steps):
-        # NO current or future observation: only steps that came before this one.
-        result = evaluate_candidate(step["command"], steps[:i], issue)
+        # Two tool calls emitted in ONE assistant reply are a single decision:
+        # neither has seen the other's output. Also exclude outputs arriving
+        # after the current assistant response (strict no-future leakage).
+        decision_msg_idx = step["assistant_message_index"]
+        past = [earlier for earlier in steps if
+                earlier["assistant_message_index"] < decision_msg_idx and
+                earlier.get("observation_message_index") is not None and
+                earlier["observation_message_index"] < decision_msg_idx]
+        result = evaluate_candidate(step["command"], past, issue)
         if result["flags"]:
             flagged_steps.append({
                 "step": step["step"],
@@ -58,6 +65,8 @@ def analyze_trajectory(record: dict[str, Any]) -> dict[str, Any]:
         "traj_id": record.get("traj_id"),
         "task_id": record.get("task_id"),
         "commands_analyzed": len(steps),
+        "no_tool_call_responses": no_tool_call_count,
+        "parse_issues": parse_issues,
         "flagged_steps": flagged_steps,
         "flag_counts": dict(sorted(by_type.items())),
         "note": "Heuristic flags only; use human labels for ground truth",
@@ -69,7 +78,7 @@ def iter_trajectories(path: Path, *, exclude: Path | None = None) -> Iterator[di
     if path.is_dir():
         for item in sorted(path.rglob("*")):
             if item.is_file() and item.suffix.lower() in {".json", ".jsonl", ".ndjson"}:
-                if item.name == "manifest.json" or (exclude and item.resolve() == exclude.resolve()):
+                if item.name in {"manifest.json", "pair_manifest.json", "drift_flags.json"} or (exclude and item.resolve() == exclude.resolve()):
                     continue
                 yield from iter_trajectories(item, exclude=exclude)
         return
@@ -100,6 +109,8 @@ def analyze_all(records: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "trajectories_analyzed": len(results),
         "commands_analyzed": sum(r["commands_analyzed"] for r in results),
+        "no_tool_call_responses": sum(r["no_tool_call_responses"] for r in results),
+        "parse_issue_count": sum(len(r["parse_issues"]) for r in results),
         "total_flagged_steps": sum(len(r["flagged_steps"]) for r in results),
         "flag_counts": dict(sorted(by_type.items())),
         "results": results,

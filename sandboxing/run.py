@@ -54,7 +54,7 @@ def cmd_smoke(cfg: Config, parallel: int) -> int:
 
 def run_one(cfg: Config, task: Task, seed: int, versions: dict) -> dict:
     """One task x one seed: fresh container, agent, grade, finalize, save."""
-    from .agent import RepeatedFailure, make_agent
+    from .agent import make_agent
 
     traj_id = trajectory.make_traj_id(task.task_id, cfg, seed)
     sb = Sandbox(cfg, task.image, traj_id)
@@ -64,10 +64,8 @@ def run_one(cfg: Config, task: Task, seed: int, versions: dict) -> dict:
         agent, env = make_agent(cfg, sb, seed)
         start, exit_status, error = time.time(), None, None
         try:
-            result = agent.run(task.problem_statement)
+            result = agent.run(task.problem_statement)  # repeat guard ends the run with an exit message
             exit_status = result.get("exit_status") if isinstance(result, dict) else str(result)
-        except RepeatedFailure:
-            exit_status = "RepeatedFailure"
         except Exception as e:
             exit_status, error = f"Error: {type(e).__name__}", str(e)[:1000]
         finally:
@@ -95,7 +93,7 @@ def run_one(cfg: Config, task: Task, seed: int, versions: dict) -> dict:
             "step_limit": cfg.step_limit,
             "max_repeats": cfg.max_repeats,
             "versions": versions,
-            "finished_at": datetime.datetime.now().isoformat(),
+            "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "seconds": seconds,
             "exit_status": exit_status,
             "error": error,

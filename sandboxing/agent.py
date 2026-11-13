@@ -14,6 +14,7 @@ import minisweagent
 import yaml
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.environments.local import LocalEnvironment
+from minisweagent.exceptions import InterruptAgentFlow
 from minisweagent.models.litellm_model import LitellmModel
 
 from .config import Config
@@ -56,13 +57,28 @@ def make_model(cfg: Config, seed: int) -> LitellmModel:
     )
 
 
-def make_agent(cfg: Config, sandbox: Sandbox, seed: int) -> tuple[DefaultAgent, "SandboxEnvironment"]:
+def make_agent(cfg: Config, sandbox: Sandbox, seed: int) -> tuple["GuardedAgent", "SandboxEnvironment"]:
     env = SandboxEnvironment(sandbox, cfg.max_repeats)
-    return DefaultAgent(make_model(cfg, seed), env, **agent_config(cfg)), env
+    return GuardedAgent(make_model(cfg, seed), env, **agent_config(cfg)), env
 
 
-class RepeatedFailure(Exception):
-    pass
+class RepeatedFailure(InterruptAgentFlow):
+    """Ends the run like mini-swe-agent's own limits do: with an `exit` message."""
+
+    def __init__(self, command: str):
+        super().__init__({"role": "exit", "content": "RepeatedFailure",
+                          "extra": {"exit_status": "RepeatedFailure", "submission": "", "command": command}})
+
+
+class GuardedAgent(DefaultAgent):
+    """Stops after the repeat guard trips, but only once the last command's output is in messages[],
+    so every tool call has its tool response (David's message-protocol check)."""
+
+    def execute_actions(self, message: dict) -> list[dict]:
+        observations = super().execute_actions(message)
+        if self.env.stopped:
+            raise RepeatedFailure(self.env.last_failed)
+        return observations
 
 
 class SandboxEnvironment(LocalEnvironment):
@@ -88,8 +104,7 @@ class SandboxEnvironment(LocalEnvironment):
             self.last_failed, self.streak = None, 0
 
         if self.max_repeats and self.streak >= self.max_repeats:
-            self.stopped = True
-            raise RepeatedFailure(command)
+            self.stopped = True  # GuardedAgent ends the run after this step's output is recorded
         return result
 
 

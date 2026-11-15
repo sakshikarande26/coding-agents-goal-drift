@@ -1,4 +1,4 @@
-import json, random, time, requests
+import copy, json, random, time, requests
 from dataclasses import dataclass, field, asdict
 
 BASH_TOOL = {"type": "function", "function": {
@@ -148,7 +148,7 @@ def clean_messages(msgs):
     for m in msgs:
         if m.get("role") not in ("system", "user", "assistant", "tool"):
             continue
-        m = {k: v for k, v in m.items() if k in KEEP}
+        m = copy.deepcopy({k: v for k, v in m.items() if k in KEEP})   # never mutate the parent trajectory
         for tc in m.get("tool_calls") or []:
             if not isinstance(tc["function"]["arguments"], str):
                 tc["function"]["arguments"] = json.dumps(tc["function"]["arguments"])
@@ -185,6 +185,11 @@ def selftest():                              # no server needed
     # diversity counts distinct normalized command sequences
     _, log = select([], [_fake("a  b"), _fake("a b"), _fake("c")], RandomScorer())
     assert log.n_distinct == 2
+    # clean_messages must not mutate its input (pairs need the parent's raw messages byte for byte)
+    raw = [{"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "bash", "arguments": {"command": "ls"}}}]}]
+    before = json.dumps(raw)
+    clean_messages(raw)
+    assert json.dumps(raw) == before
     print("selftest ok")
 
 if __name__ == "__main__":

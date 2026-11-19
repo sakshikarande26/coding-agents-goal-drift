@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Validate preference-pair JSON/JSONL files, optionally matching trajectory parents.
+"""Validate finalized chosen/rejected preference pairs (JSON or JSONL).
 
-From project root:
-  python -m data_eval.validate_pairs examples/pairs/valid_pair.json
-  python -m data_eval.validate_pairs pairs/v1/ --trajectories rollouts/v1/
+Use AFTER independent A/B human annotations have been consolidated into a
+final preference. Ties and unresolved/uncertain comparisons stay in annotation
+files; this validator deliberately does not assign a preference or convert
+annotations into training examples.
 
-No external Python packages. The pair contract is v0/provisional: coordinate
-exact chosen/rejected representation and drift_type labels with Track 3.
+From the repository root:
+    python -m data_eval.validate_pairs examples/pairs/valid_pair.json
+    python -m data_eval.validate_pairs pairs/final/ --trajectories rollouts/
+
+Python 3.9+; no external packages. See PAIR_SCHEMA_UPDATE.md.
 """
 from __future__ import annotations
 
@@ -25,76 +29,128 @@ except ImportError:
     from branching import shared_prefix
     from validate_trajectories import SPLITS, collect_inputs, iter_records
 
-DRIFT_TYPES = {"loop", "edits_tests", "unrelated_edit", "scope_creep", "hardcode", "skipped_requirement"}
-LABEL_SOURCES = {"auto", "human"}
+DRIFT_TYPES = frozenset({
+    "loop", "edits_tests", "unrelated_edit", "scope_creep",
+    "hardcode", "skipped_requirement",
+})
+LABEL_SOURCES = frozenset({"auto", "human"})
 
 PAIR_SCHEMA = {
-    "name": "preference_pair",
-    "version": "0.2-audited-provisional",
+    "name": "finalized_preference_pair",
+    "version": "0.3-multilabel",
     "required_fields": {
-        "pair_id": "non-empty string; unique in batch",
+        "pair_id": "non-empty string, unique in batch",
         "task_id": "non-empty string",
-        "parent_traj_id": "non-empty string; links to parent trajectory",
-        "prefix_len": "integer >= 0; completed assistant+tool pairs",
-        "prompt_messages": "array of raw prompt/history message objects",
-        "chosen": "non-empty assistant completion (string or raw message object)",
-        "rejected": "non-empty assistant completion (string or raw message object)",
+        "parent_traj_id": "non-empty string linking to parent trajectory",
+        "prefix_len": "integer >= 0; completed assistant+tool turns in parent",
+        "prompt_messages": "verbatim array of raw shared history message objects",
+        "chosen": "non-empty assistant completion (string or raw assistant message object)",
+        "rejected": "non-empty assistant completion (string or raw assistant message object)",
+        "chosen_drift": "list of distinct drift-type strings; [] means no identified drift",
+        "rejected_drift": "list of distinct drift-type strings; [] means no identified drift",
         "label_source": "auto or human",
-        "drift_type": "one of six project drift types or 'none'",
-        "split": "train, heldout, verified",
+        "split": "train, heldout, or verified",
     },
-    "optional_fields": {"chosen_idx": "integer >= 0", "rejected_idx": "integer >= 0",
-                        "prefix_message_count": "integer >= 0; disambiguates prefixes after no-tool responses",
-                        "chosen_traj_id": "optional string for provenance", "rejected_traj_id": "optional string for provenance"}
+    "optional_fields": {
+        "chosen_idx": "integer >= 0, must accompany rejected_idx",
+        "rejected_idx": "integer >= 0, must accompany chosen_idx",
+        "prefix_message_count": "integer >= 0; disambiguates no-tool-call prefix boundaries",
+        "chosen_traj_id": "non-empty string for provenance",
+        "rejected_traj_id": "non-empty string for provenance",
+    },
+    "notes": [
+        "Preference is encoded by chosen/rejected ordering, not a separate preference field.",
+        "Each drift list can contain multiple labels and may be empty.",
+        "Do not use the strings 'none' or 'uncertain' in finalized drift lists.",
+        "Ties, uncertain judgments, and individual A/B votes belong in annotation data.",
+        "The deprecated pair-level drift_type field is rejected to prevent silent data loss.",
+    ],
 }
 
 
+def _valid_nonempty_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _is_nonnegative_int(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _validate_drift_list(value: Any, field: str) -> list[str]:
+    """Check FINAL labels; uncertainty must be adjudicated before export."""
+    if not isinstance(value, list):
+        return [f"{field}: expected a list (use [] for no identified drift)"]
+    errors: list[str] = []
+    seen: set[str] = set()
+    for i, item in enumerate(value):
+        if not isinstance(item, str):
+            errors.append(f"{field}[{i}]: expected drift-type string")
+        elif item not in DRIFT_TYPES:
+            errors.append(f"{field}[{i}]: unknown drift type {item!r}; allowed: {sorted(DRIFT_TYPES)}")
+        elif item in seen:
+            errors.append(f"{field}[{i}]: duplicate drift type {item!r}")
+        else:
+            seen.add(item)
+    return errors
+
+
 def validate_pair(pair: Any) -> list[str]:
+    """Return all schema errors; never modifies the supplied pair."""
     errors: list[str] = []
     if not isinstance(pair, dict):
         return ["root: expected object"]
-    for f in ("pair_id", "task_id", "parent_traj_id"):
-        val = pair.get(f)
-        if not isinstance(val, str) or not val.strip():
-            errors.append(f"{f}: required non-empty string")
-    n = pair.get("prefix_len")
-    if type(n) is not int or n < 0:
+
+    for field in ("pair_id", "task_id", "parent_traj_id"):
+        if not _valid_nonempty_text(pair.get(field)):
+            errors.append(f"{field}: required non-empty string")
+
+    if not _is_nonnegative_int(pair.get("prefix_len")):
         errors.append("prefix_len: expected integer >= 0")
+
     prompt = pair.get("prompt_messages")
     if not isinstance(prompt, list):
         errors.append("prompt_messages: expected array")
     else:
         for i, msg in enumerate(prompt):
-            if not isinstance(msg, dict) or not isinstance(msg.get("role"), str) or not msg["role"]:
+            if not isinstance(msg, dict) or not _valid_nonempty_text(msg.get("role")):
                 errors.append(f"prompt_messages[{i}]: expected message object with role")
-    for f in ("chosen", "rejected"):
-        val = pair.get(f)
+
+    for field in ("chosen", "rejected"):
+        val = pair.get(field)
         if isinstance(val, str):
             if not val.strip():
-                errors.append(f"{f}: completion cannot be empty")
+                errors.append(f"{field}: completion cannot be empty")
         elif isinstance(val, dict):
             if val.get("role") != "assistant":
-                errors.append(f"{f}: message object must have role='assistant'")
+                errors.append(f"{field}: message object must have role='assistant'")
             if not val.get("content") and not val.get("tool_calls") and not val.get("reasoning_content"):
-                errors.append(f"{f}: no content, tool calls, or reasoning")
+                errors.append(f"{field}: no content, tool calls, or reasoning")
         else:
-            errors.append(f"{f}: expected non-empty string or assistant message object")
+            errors.append(f"{field}: expected non-empty string or assistant message object")
+
     if "chosen" in pair and "rejected" in pair and pair["chosen"] == pair["rejected"]:
         errors.append("chosen and rejected: cannot be identical")
-    if pair.get("label_source") not in LABEL_SOURCES:
+
+    for field in ("chosen_drift", "rejected_drift"):
+        errors.extend(_validate_drift_list(pair.get(field), field))
+
+    if "drift_type" in pair:
+        errors.append("drift_type: deprecated single pair label; use chosen_drift and rejected_drift lists")
+    if "preference" in pair:
+        errors.append("preference: A/B/tie/uncertain belongs in human annotations, not finalized chosen/rejected pairs")
+    if not isinstance(pair.get("label_source"), str) or pair["label_source"] not in LABEL_SOURCES:
         errors.append(f"label_source: must be one of {sorted(LABEL_SOURCES)}")
-    if pair.get("drift_type") not in DRIFT_TYPES | {"none"}:
-        errors.append(f"drift_type: must be one of {sorted(DRIFT_TYPES | {'none'})}")
-    if pair.get("split") not in SPLITS:
+    if not isinstance(pair.get("split"), str) or pair["split"] not in SPLITS:
         errors.append(f"split: must be one of {sorted(SPLITS)}")
-    if "prefix_message_count" in pair and (type(pair["prefix_message_count"]) is not int or pair["prefix_message_count"] < 0):
+
+    if "prefix_message_count" in pair and not _is_nonnegative_int(pair["prefix_message_count"]):
         errors.append("prefix_message_count: expected integer >= 0")
-    for f in ("chosen_traj_id", "rejected_traj_id"):
-        if f in pair and (not isinstance(pair[f], str) or not pair[f].strip()):
-            errors.append(f"{f}: expected nonempty string")
-    for f in ("chosen_idx", "rejected_idx"):
-        if f in pair and (type(pair[f]) is not int or pair[f] < 0):
-            errors.append(f"{f}: expected integer >= 0")
+    for field in ("chosen_traj_id", "rejected_traj_id"):
+        if field in pair and not _valid_nonempty_text(pair[field]):
+            errors.append(f"{field}: expected nonempty string")
+    for field in ("chosen_idx", "rejected_idx"):
+        if field in pair and not _is_nonnegative_int(pair[field]):
+            errors.append(f"{field}: expected integer >= 0")
     if ("chosen_idx" in pair) != ("rejected_idx" in pair):
         errors.append("chosen_idx and rejected_idx: supply both or neither")
     if ("chosen_idx" in pair and "rejected_idx" in pair and
@@ -104,7 +160,7 @@ def validate_pair(pair: Any) -> list[str]:
 
 
 def _first_command(value: Any) -> str | None:
-    """Compare action choices ignoring incidental tool-call IDs."""
+    """Compare single-command choices, ignoring incidental tool-call IDs."""
     if isinstance(value, str):
         return value.strip() or None
     if isinstance(value, dict):
@@ -150,15 +206,16 @@ def load_parent_map(source: Path) -> dict[str, dict]:
 
 
 def validate_pairs(source: Path, *, trajectories: Path | None = None) -> dict:
+    """Validate a batch and, optionally, the exact parent prefix for each pair."""
     parents = load_parent_map(trajectories) if trajectories is not None else None
-    files = collect_inputs(source)
-    # Manifest files are outputs, not pair records.
-    files = [p for p in files if p.name not in {"pair_manifest.json", "manifest.json"}]
+    files = [p for p in collect_inputs(source) if p.name not in {"pair_manifest.json", "manifest.json"}]
     seen_ids: dict[str, str] = {}
     counts = Counter()
-    types = Counter()
+    chosen_types = Counter()
+    rejected_types = Counter()
     splits = Counter()
     issues: list[dict] = []
+
     for path in files:
         try:
             for location, rec, parse_error in iter_records(path):
@@ -167,13 +224,13 @@ def validate_pairs(source: Path, *, trajectories: Path | None = None) -> dict:
                 warnings = [] if parse_error else pair_warnings(rec)
                 if isinstance(rec, dict):
                     ident = rec.get("pair_id")
-                    if isinstance(ident, str) and ident.strip():
+                    if _valid_nonempty_text(ident):
                         if ident in seen_ids:
                             errors.append(f"pair_id: duplicate of {seen_ids[ident]}")
                         else:
                             seen_ids[ident] = location
-                    if parents is not None and not any(x.startswith("parent_traj_id:") for x in errors):
-                        parent = parents.get(rec.get("parent_traj_id"))
+                    if parents is not None and _valid_nonempty_text(rec.get("parent_traj_id")):
+                        parent = parents.get(rec["parent_traj_id"])
                         if parent is None:
                             errors.append("parent_traj_id: not found in provided trajectories")
                         else:
@@ -181,9 +238,11 @@ def validate_pairs(source: Path, *, trajectories: Path | None = None) -> dict:
                                 errors.append("task_id: does not match parent trajectory")
                             if rec.get("split") != parent.get("split"):
                                 errors.append("split: does not match parent trajectory")
-                            if type(rec.get("prefix_len")) is int and rec["prefix_len"] >= 0:
-                                expected, err = shared_prefix(parent.get("messages"), rec["prefix_len"],
-                                                              prefix_message_count=rec.get("prefix_message_count"))
+                            if _is_nonnegative_int(rec.get("prefix_len")):
+                                expected, err = shared_prefix(
+                                    parent.get("messages"), rec["prefix_len"],
+                                    prefix_message_count=rec.get("prefix_message_count"),
+                                )
                                 if err:
                                     errors.append(f"parent prompt prefix: {err}")
                                 elif rec.get("prompt_messages") != expected:
@@ -192,25 +251,35 @@ def validate_pairs(source: Path, *, trajectories: Path | None = None) -> dict:
                     counts["invalid_pairs"] += 1
                 else:
                     counts["valid_pairs"] += 1
-                    types[rec["drift_type"]] += 1
+                    chosen_types.update(rec["chosen_drift"])
+                    rejected_types.update(rec["rejected_drift"])
                     splits[rec["split"]] += 1
                 counts["warnings"] += len(warnings)
                 if errors or warnings:
-                    issues.append({"location": location, "pair_id": rec.get("pair_id") if isinstance(rec, dict) else None,
-                                   "errors": errors, "warnings": warnings})
+                    issues.append({
+                        "location": location,
+                        "pair_id": rec.get("pair_id") if isinstance(rec, dict) else None,
+                        "errors": errors,
+                        "warnings": warnings,
+                    })
         except (UnicodeError, OSError) as exc:
             counts["records_scanned"] += 1
             counts["invalid_pairs"] += 1
-            issues.append({"location": str(path), "pair_id": None, "errors": [f"File read error: {exc}"]})
+            issues.append({"location": str(path), "pair_id": None,
+                           "errors": [f"File read error: {exc}"], "warnings": []})
+
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": str(source),
         "trajectory_source": str(trajectories) if trajectories else None,
         "schema": PAIR_SCHEMA,
-        "counts": {"files_scanned": len(files), "records_scanned": counts["records_scanned"],
-                   "valid_pairs": counts["valid_pairs"], "invalid_pairs": counts["invalid_pairs"],
-                   "warnings": counts["warnings"]},
-        "valid_by_drift_type": dict(sorted(types.items())),
+        "counts": {
+            "files_scanned": len(files), "records_scanned": counts["records_scanned"],
+            "valid_pairs": counts["valid_pairs"], "invalid_pairs": counts["invalid_pairs"],
+            "warnings": counts["warnings"],
+        },
+        "valid_by_chosen_drift_type": dict(sorted(chosen_types.items())),
+        "valid_by_rejected_drift_type": dict(sorted(rejected_types.items())),
         "valid_by_split": dict(sorted(splits.items())),
         "issues": issues,
     }
@@ -218,9 +287,9 @@ def validate_pairs(source: Path, *, trajectories: Path | None = None) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", type=Path, help="Pair JSON/JSONL file or directory")
+    parser.add_argument("input", type=Path, help="Finalized pair JSON/JSONL file or directory")
     parser.add_argument("--trajectories", type=Path,
-                        help="Optional trajectory JSON/JSONL files for exact parent prompt checks")
+                        help="Optional parent trajectory JSON/JSONL files for exact prefix comparison")
     parser.add_argument("--manifest", type=Path, help="Output path for pair_manifest.json")
     args = parser.parse_args()
     try:

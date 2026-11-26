@@ -1,5 +1,6 @@
 """Command line entry point.
 
+    goal-drift sample  --config sandboxing/pilot.yaml            # make the frozen task list (once, for the whole team)
     goal-drift smoke   --config sandboxing/pilot.yaml            # sandbox + grading only, no GPU
     goal-drift run     --config sandboxing/pilot.yaml            # full rollouts
     goal-drift doctor  --config sandboxing/pilot.yaml            # which backend, GPU and server this machine has
@@ -20,7 +21,17 @@ from pathlib import Path
 from . import grading, trajectory
 from .config import Config, load_config
 from .sandbox import Sandbox
-from .tasks import Task, load_tasks
+from .tasks import Task, load_tasks, sample_task_list, save_task_list
+
+
+def cmd_sample(cfg: Config) -> int:
+    task_list = sample_task_list(cfg)
+    save_task_list(cfg, task_list)
+    counts = {s: sum(t["split"] == s for t in task_list["tasks"]) for s in ("train", "heldout")}
+    print(f"Saved {cfg.task_list}: {counts['train']} train + {counts['heldout']} heldout tasks "
+          f"from {len(task_list['pool_per_repo'])} repos (fixed_seed {cfg.fixed_seed})")
+    print("Small-fix pool per repo:", task_list["pool_per_repo"])
+    return 0
 
 
 def cmd_smoke(cfg: Config, parallel: int) -> int:
@@ -103,6 +114,7 @@ def run_one(cfg: Config, task: Task, seed: int, versions: dict) -> dict:
             "test_summary": grading.summary(output),
             "ref_patch_files": task.gold_files(),
             "files_touched": grading.edited_files(patch),  # reverted edits are only in messages
+            "files_created": grading.new_files(patch),  # part of files_touched
             "patch": patch,
             "messages": agent.messages,  # untruncated: DPO needs the exact prompt and completions
         }
@@ -115,15 +127,16 @@ def run_one(cfg: Config, task: Task, seed: int, versions: dict) -> dict:
     return traj
 
 
-def cmd_run(cfg: Config) -> int:
+def cmd_run(cfg: Config, shard: tuple[int, int]) -> int:
     from . import server
     from .agent import get_versions
 
-    tasks = load_tasks(cfg)
+    tasks = load_tasks(cfg, shard)
+    print(f"{len(tasks)} {cfg.split} task(s) x seeds {cfg.seeds} (shard {shard[0]}/{shard[1]})")
     proc = server.start(cfg)
     try:
         print("Model says:", server.ping(cfg)[:200])
-        versions = get_versions(cfg)
+        versions = {**get_versions(cfg), **server.engine_info(cfg)}
         print(versions)
         done, skipped = [], []
         for task in tasks:
@@ -134,8 +147,13 @@ def cmd_run(cfg: Config) -> int:
                 print("All seeds already saved, skipping")
                 continue
             puller = Sandbox(cfg, task.image, "pull")
-            puller.pull()
-            smoke = grading.smoke_test(Sandbox(cfg, task.image, f"{task.task_id[:12]}__smoke__pid{os.getpid()}"), task)
+            try:  # a broken task image must not stop the other tasks of this job
+                puller.pull()
+                smoke = grading.smoke_test(Sandbox(cfg, task.image, f"{task.task_id[:12]}__smoke__pid{os.getpid()}"), task)
+            except Exception as e:
+                print(f"Task setup crashed: {type(e).__name__}: {str(e)[:300]}")
+                skipped.append(task.task_id)
+                continue
             print(f"Smoke test: BUGGY {smoke['buggy']} | FIXED {smoke['fixed']} -> {'OK' if smoke['ok'] else 'FAIL'}")
             if not smoke["ok"]:
                 skipped.append(task.task_id)
@@ -193,10 +211,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="goal-drift", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("smoke", "run", "doctor"):
+    for name in ("sample", "smoke", "run", "doctor"):
         p = sub.add_parser(name)
         p.add_argument("--config", type=Path, default=Path(__file__).with_name("pilot.yaml"))
-        p.add_argument("--n-tasks", type=int, help="override n_tasks")
+        p.add_argument("--n-tasks", type=int, help="override n_tasks: first N tasks of the split")
+        p.add_argument("--split", choices=["train", "heldout"], help="override split")
+        p.add_argument("--seeds", type=int, nargs="+", help="override seeds, e.g. --seeds 0 1")
         p.add_argument("--work-dir", type=str, help="override work_dir")
         p.add_argument("--run-name", type=str, help="override run_name (results/<run_name>/)")
         p.add_argument("--steps", type=int, help="override step_limit")
@@ -205,16 +225,26 @@ def main(argv: list[str] | None = None) -> int:
                        help="use a model server that is already running, e.g. llama-server on COOK")
         if name == "smoke":
             p.add_argument("--parallel", type=int, default=1, help="run the first task in K sandboxes at once")
+        if name == "run":
+            p.add_argument("--shard", type=str, default="0/1",
+                           help="i/n: run every n-th task starting at i (parallel jobs, e.g. a Slurm array)")
     args = parser.parse_args(argv)
     cfg = load_config(args.config, n_tasks=args.n_tasks, work_dir=args.work_dir, run_name=args.run_name,
                       step_limit=args.steps, thinking=False if args.no_thinking else None,
-                      server_url=args.server_url)
+                      split=args.split, seeds=args.seeds, server_url=args.server_url)
 
+    if args.command == "sample":
+        return cmd_sample(cfg)
     if args.command == "smoke":
         return cmd_smoke(cfg, args.parallel)
     if args.command == "doctor":
         return cmd_doctor(cfg)
-    return cmd_run(cfg)
+    try:
+        index, count = (int(x) for x in args.shard.split("/"))
+        assert 0 <= index < count
+    except (ValueError, AssertionError):
+        parser.error(f"--shard must be i/n with 0 <= i < n, got {args.shard!r}")
+    return cmd_run(cfg, (index, count))
 
 
 if __name__ == "__main__":

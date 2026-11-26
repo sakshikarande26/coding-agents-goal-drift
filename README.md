@@ -45,16 +45,21 @@ pip install -e ".[udocker]"     # add vllm on a machine that serves the model: p
 udocker install                 # once (on Colab: udocker --allow-root install). Not needed on Unity (apptainer)
 
 goal-drift doctor               # shows backend, GPU, model server and results folder for this machine
+goal-drift sample               # makes the frozen task list (already done: sandboxing/task_list.json)
 goal-drift smoke                # checks the sandbox and grading; no GPU needed
 goal-drift run                  # starts vLLM, runs the agent, saves results/<run_name>/*.json
 ```
 
-Settings are in `sandboxing/pilot.yaml`. Common flags: `--n-tasks`, `--steps`, `--no-thinking`, `--run-name`.
+Settings are in `sandboxing/pilot.yaml` (small test) and `sandboxing/cook_8b.yaml` (the real batch). Common flags: `--n-tasks`, `--split train|heldout`, `--seeds 0 1`, `--shard i/n`, `--steps`, `--no-thinking`, `--run-name`, `--server-url`.
+
+**Task list.** `sandboxing/task_list.json` is frozen: small fixes from R2E-Gym-Lite (at most 1 non-test file and 10 lines, 1,597 tasks), then 15 train + 9 heldout per repo, picked at random with `fixed_seed: 2026` (any fixed number gives the same tasks every time), so 150 train + 90 heldout. Tasks are in repo round-robin order, so the first 100 train tasks are 10 per repo. Do not regenerate it; heldout tasks are for the final eval only.
 
 - **Unity:** set `work_dir` in `pilot.yaml` to a `/work/...` path.
-- **COOK** (vLLM does not run on its GPUs): start `llama-server` on port 8080, then `goal-drift run --server-url http://localhost:8080/v1 --run-name cook_dev`.
+- **COOK** (vLLM does not run on its GPUs): `sandboxing/cook_run.sbatch` runs one llama-server and one shard of the tasks per GPU (see the comments at its top).
 
 ## Results
+
+[`results/cook_8b_v2/`](results/cook_8b_v2/) is the trajectory set for making pairs: 165 runs. That is seed 0 on 88 of the first 100 train tasks (8 to 10 per repo), plus seeds 1 to 4 on 29 of them from an earlier, larger plan. The other 12 tasks failed the smoke test: 7 because our test-output parser missed colored output and test names with spaces (fixed in `grading.py`, to be rerun), 2 need internet, 2 have a wrong answer key in R2E-Gym, 1 has a flaky test. Qwen3-8B (Q8_0, llama-server on COOK), thinking on, `unguided`, 30-step limit, repeat guard 5. Every file passes `data_eval/validate_trajectories.py`. Runs that end with `Submitted` get a warning: the final submit command has no tool output, because mini-swe-agent stops there. Branch only from these train runs.
 
 [`results/cook_dev/`](results/cook_dev/) has one trajectory on the aiohttp task (thinking on, 30-step limit). The agent was stopped after 8 steps by the repeat guard, in 81 s, without fixing the bug (13/14 tests). It passes `data_eval/validate_trajectories.py`.
 

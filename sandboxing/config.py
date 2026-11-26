@@ -70,8 +70,11 @@ class Config:
     run_name: str = "dev"
     dataset: str = "R2E-Gym/R2E-Gym-Lite"
     dataset_split: str = "train"
-    n_tasks: int = 5
-    max_per_repo: int = 2
+    task_list: Path = Path("sandboxing/task_list.json")  # frozen sample, made once by `goal-drift sample`
+    fixed_seed: int = 2026  # seed of the random task sample (any fixed number; it must never change)
+    train_per_repo: int = 15
+    heldout_per_repo: int = 9
+    n_tasks: int | None = None  # None = every task of `split` in the task list
     max_non_test_files: int = 1
     max_non_test_lines: int = 10
     seeds: list = field(default_factory=lambda: [0])
@@ -156,8 +159,10 @@ def _validate(cfg: Config) -> None:
         problems.append("max_repeats must be >= 0 (0 = off)")
     if not cfg.run_name or "/" in cfg.run_name:
         problems.append("run_name must be a plain folder name, e.g. pilot_4b_think")
-    if cfg.n_tasks < 1:
-        problems.append("n_tasks must be >= 1")
+    if cfg.n_tasks is not None and cfg.n_tasks < 1:
+        problems.append("n_tasks must be >= 1, or null for all tasks")
+    if cfg.train_per_repo < 1 or cfg.heldout_per_repo < 0:
+        problems.append("train_per_repo must be >= 1 and heldout_per_repo >= 0")
     if problems:
         raise ConfigError("Bad config:\n  - " + "\n  - ".join(problems))
 
@@ -175,6 +180,8 @@ def load_config(path: str | Path, **overrides: Any) -> Config:
     data["work_dir"] = Path(data.get("work_dir", "~/goal-drift-work")).expanduser().resolve()
     results = Path(data.get("results_dir", "results")).expanduser()
     data["results_dir"] = results if results.is_absolute() else (REPO_ROOT / results).resolve()
+    task_list = Path(data.get("task_list", "sandboxing/task_list.json")).expanduser()
+    data["task_list"] = task_list if task_list.is_absolute() else (REPO_ROOT / task_list).resolve()
     if data.get("backend", "auto") == "auto":
         data["backend"] = detect_backend(data.get("apptainer_bin", "apptainer"))
     cfg = Config(server=ServerConfig(**server), **data)

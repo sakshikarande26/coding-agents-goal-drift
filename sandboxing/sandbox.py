@@ -27,6 +27,11 @@ PATHSPEC = (
     "':(exclude)patch.txt' ':(glob,exclude)**/__pycache__/**' ':(glob,exclude)**/*.pyc'"
 )
 
+# Stage every agent-visible change. git add exits 1 (and prints a hint) when the repo's .gitignore
+# already ignores a path we exclude, e.g. coveragepy ignores .venv; everything else is still staged,
+# so callers run the next git command with `;`, not `&&`.
+GIT_ADD = f"git add -A {PATHSPEC} 2>/dev/null"
+
 # Hidden-test folders, relative to the container's / .
 TEST_DIRS = ["r2e_tests", "testbed/r2e_tests"]
 
@@ -138,7 +143,7 @@ class Sandbox:
             sh(f"cp -a {self._pristine} {self.root}")
         if self.backend != "docker" and not (self.root and (self.root / "testbed").is_dir()):
             raise RuntimeError(f"Container root has no /testbed: {self.root}")
-        self.base = self.exec(f"git add -A {PATHSPEC} && git write-tree").splitlines()[-1].strip()
+        self.base = self.exec(f"{GIT_ADD}; git write-tree").splitlines()[-1].strip()
         if not re.fullmatch(r"[0-9a-f]{40}", self.base):
             raise RuntimeError(f"Could not snapshot the working tree: {self.base}")
 

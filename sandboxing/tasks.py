@@ -6,7 +6,9 @@ The agent never sees them.
 
 from __future__ import annotations
 
+import datetime
 import json
+import random
 from dataclasses import dataclass
 from functools import cached_property
 
@@ -68,23 +70,90 @@ class Task:
         return edits
 
 
-def _stream(cfg: Config):
+FILTER_COLUMNS = ["commit_hash", "repo_name", "num_non_test_files", "num_non_test_lines"]
+
+
+def _dataset(cfg: Config):
+    """The whole split, downloaded once into the Hugging Face cache (about 1 GB for R2E-Gym-Lite train),
+    so parallel jobs read it from disk instead of each streaming it."""
     from datasets import load_dataset
 
-    return load_dataset(cfg.dataset, split=cfg.dataset_split, streaming=True)
+    return load_dataset(cfg.dataset, split=cfg.dataset_split)
 
 
-def load_tasks(cfg: Config) -> list[Task]:
-    """Small fixes only, with a cap per repo so we keep some variety."""
-    tasks, per_repo = [], {}
-    for row in _stream(cfg):
-        if row["num_non_test_files"] > cfg.max_non_test_files or row["num_non_test_lines"] > cfg.max_non_test_lines:
-            continue
-        repo = row["repo_name"]
-        if per_repo.get(repo, 0) >= cfg.max_per_repo:
-            continue
-        per_repo[repo] = per_repo.get(repo, 0) + 1
-        tasks.append(Task(row))
-        if len(tasks) >= cfg.n_tasks:
-            break
-    return tasks
+def _small_fix(row: dict, cfg: Config) -> bool:
+    return row["num_non_test_files"] <= cfg.max_non_test_files and row["num_non_test_lines"] <= cfg.max_non_test_lines
+
+
+def _round_robin(tasks: list[dict]) -> list[dict]:
+    """Interleave repos (A1 B1 C1 ... A2 B2 C2 ...), so the first k tasks of a split cover the repos evenly."""
+    by_repo: dict[str, list[dict]] = {}
+    for t in tasks:
+        by_repo.setdefault(t["repo"], []).append(t)
+    queues = [by_repo[r] for r in sorted(by_repo)]
+    out = []
+    for i in range(max(map(len, queues), default=0)):
+        out += [q[i] for q in queues if i < len(q)]
+    return out
+
+
+def sample_task_list(cfg: Config) -> dict:
+    """Seeded random sample of small-fix tasks, the same number from every repo,
+    split into train and held-out inside each repo. Same settings = same list."""
+    pool: dict[str, list[str]] = {}
+    for row in _dataset(cfg).select_columns(FILTER_COLUMNS):
+        if _small_fix(row, cfg):
+            pool.setdefault(row["repo_name"], []).append(row["commit_hash"])
+    need = cfg.train_per_repo + cfg.heldout_per_repo
+    short = {repo: len(ids) for repo, ids in pool.items() if len(ids) < need}
+    if short:
+        raise ValueError(f"These repos have fewer than {need} small-fix tasks: {short}. Lower the per-repo counts.")
+    rng = random.Random(cfg.fixed_seed)
+    train, heldout = [], []
+    for repo in sorted(pool):
+        picked = rng.sample(sorted(pool[repo]), need)  # sorted first, so dataset order does not matter
+        train += [{"task_id": t, "repo": repo, "split": "train"} for t in picked[:cfg.train_per_repo]]
+        heldout += [{"task_id": t, "repo": repo, "split": "heldout"} for t in picked[cfg.train_per_repo:]]
+    return {
+        "dataset": cfg.dataset,
+        "dataset_split": cfg.dataset_split,
+        "filter": {"max_non_test_files": cfg.max_non_test_files, "max_non_test_lines": cfg.max_non_test_lines},
+        "fixed_seed": cfg.fixed_seed,
+        "train_per_repo": cfg.train_per_repo,
+        "heldout_per_repo": cfg.heldout_per_repo,
+        "pool_per_repo": {repo: len(ids) for repo, ids in sorted(pool.items())},
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "tasks": _round_robin(train) + _round_robin(heldout),
+    }
+
+
+def save_task_list(cfg: Config, task_list: dict) -> None:
+    """The list is frozen once made: train and held-out tasks must never change. Refuse to overwrite."""
+    if cfg.task_list.exists():
+        raise FileExistsError(f"{cfg.task_list} already exists. The task list is frozen; delete it by hand only "
+                              "if no runs were made from it.")
+    cfg.task_list.parent.mkdir(parents=True, exist_ok=True)
+    cfg.task_list.write_text(json.dumps(task_list, indent=1) + "\n")
+
+
+def load_tasks(cfg: Config, shard: tuple[int, int] = (0, 1)) -> list[Task]:
+    """Tasks of cfg.split from the frozen task list, in list order (repos interleaved).
+    n_tasks keeps the first n (e.g. a pilot). shard (i, n) keeps every n-th task from i, for parallel jobs."""
+    if not cfg.task_list.exists():
+        raise FileNotFoundError(f"No task list at {cfg.task_list}. Run `goal-drift sample` once first.")
+    task_list = json.loads(cfg.task_list.read_text())
+    if task_list["dataset"] != cfg.dataset or task_list["dataset_split"] != cfg.dataset_split:
+        raise ValueError(f"{cfg.task_list} was made from {task_list['dataset']}:{task_list['dataset_split']}, "
+                         f"but the config says {cfg.dataset}:{cfg.dataset_split}")
+    ids = [t["task_id"] for t in task_list["tasks"] if t["split"] == cfg.split]
+    if not ids:
+        raise ValueError(f"{cfg.task_list} has no {cfg.split!r} tasks")
+    ids = ids[:cfg.n_tasks] if cfg.n_tasks else ids
+    index, count = shard
+    ids = ids[index::count]
+    ds = _dataset(cfg)
+    position = {task_id: i for i, task_id in enumerate(ds["commit_hash"])}
+    missing = [i for i in ids if i not in position]
+    if missing:
+        raise ValueError(f"{len(missing)} listed task(s) not found in {cfg.dataset}: {missing[:3]}")
+    return [Task(ds[position[i]]) for i in ids]

@@ -1,0 +1,47 @@
+# COOK rollout settings: Qwen3-8B (Q8 GGUF) served by llama-server, one GPU per job.
+# Used by sandboxing/cook_run.sbatch. Same task list and harness as pilot.yaml.
+
+# --- Sandbox ---
+backend: auto               # auto = apptainer if installed (Unity), else docker if it runs, else udocker (Colab, COOK)
+apptainer_bin: apptainer    # use "singularity" on clusters that only have the old name
+
+# --- Outputs ---
+# Results: one JSON per run goes to <results_dir>/<run_name>/ (relative = inside the repo).
+results_dir: results
+run_name: cook_8b_v2         # the full batch; the pilot uses --run-name cook_8b_pilot
+# Scratch: container images, hidden tests, per-run copies. Outside the repo; the agent must never see it.
+# On Unity use a /work path (apptainer refuses $HOME).
+work_dir: ~/goal-drift-work
+cleanup_images: true        # delete each task's image after its runs
+
+# --- Model ---
+model: Qwen/Qwen3-8B        # the weights are the Q8 GGUF that cook_run.sbatch serves
+thinking: true              # Khoa's diversity test: thinking on keeps candidate commands diverse
+# Qwen's recommended settings per mode. The run uses the one that matches `thinking`.
+sampling:
+  thinking_on:  {temperature: 0.6, top_p: 0.95, top_k: 20, presence_penalty: 1.5}
+  thinking_off: {temperature: 0.7, top_p: 0.8,  top_k: 20, presence_penalty: 1.5}
+
+# --- Model server ---
+server:
+  start: false              # cook_run.sbatch starts llama-server and passes --server-url
+
+# --- Tasks ---
+dataset: R2E-Gym/R2E-Gym-Lite
+dataset_split: train
+max_non_test_files: 1       # small fixes only
+max_non_test_lines: 10
+# Frozen task list: `goal-drift sample` makes it once (seeded, same count per repo, split inside each repo).
+# Never remake it after runs exist: train and held-out tasks must not change.
+task_list: sandboxing/task_list.json
+fixed_seed: 2026            # seed of the random task sample: same number, same tasks
+train_per_repo: 15          # 10 repos x 15 = 150 train tasks (rollouts, pairs, training)
+heldout_per_repo: 9         # 10 repos x 9  = 90 held-out tasks (final evaluation only)
+n_tasks: 100                # first 100 train tasks = 10 per repo (enough for ~300 pairs); null = all 150
+
+# --- Runs ---
+seeds: [0]                  # one run per task: pairs come from branching, so task variety matters more than seeds
+step_limit: 30
+max_repeats: 5              # stop after this many identical failing commands in a row (0 = off)
+condition: unguided         # allowed values come from data_eval/validate_trajectories.py (CONDITIONS)
+split: train                # train | heldout | verified

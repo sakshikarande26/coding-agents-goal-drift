@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 import re
 
-from .sandbox import PATHSPEC, Sandbox
+from .sandbox import GIT_ADD, Sandbox
 from .tasks import Task
 
 TEST_CMD = "bash run_tests.sh"
@@ -17,14 +17,18 @@ def run_tests(sb: Sandbox) -> str:
     return sb.exec(f"[ -e r2e_tests ] || cp -r /r2e_tests r2e_tests; {TEST_CMD}")
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*m")  # terminal colors: some images print them, and some answer keys contain them
+
+
 def parse_results(output: str) -> dict:
     results = {}
-    for line in output.splitlines():
+    for line in ANSI.sub("", output).splitlines():
         words = line.split()
         if len(words) < 2:
             continue
         if words[0] in STATUSES:
-            results[words[1]] = words[0]
+            # "PASSED path::test[param with spaces]" or "FAILED path::test - message": the name is the rest of the line
+            results[line.split(None, 1)[1].split(" - ")[0].strip()] = words[0]
         elif words[1] in STATUSES:
             results[words[0]] = words[1]
     return results
@@ -33,6 +37,7 @@ def parse_results(output: str) -> dict:
 def grade(output: str, expected: dict) -> tuple[int, list]:
     """Return (number of tests that match the answer key, list of mismatches)."""
     results = {name.replace("::", "."): status for name, status in parse_results(output).items()}
+    expected = {ANSI.sub("", name): wanted for name, wanted in expected.items()}
     mismatches = []
     for test_name, wanted in expected.items():
         got = "missing"
@@ -52,11 +57,16 @@ def summary(output: str) -> str:
 
 def get_patch(sb: Sandbox) -> str:
     """The agent's edits relative to the starting snapshot (not HEAD)."""
-    return sb.exec(f"git add -A {PATHSPEC} && git diff --cached {sb.base}")
+    return sb.exec(f"{GIT_ADD}; git diff --cached {sb.base}")
 
 
 def edited_files(patch: str) -> list[str]:
     return sorted(set(re.findall(r"^diff --git a/(\S+) b/", patch, re.M)))
+
+
+def new_files(patch: str) -> list[str]:
+    """Files the agent created (e.g. a scratch repro script), not edits to existing files."""
+    return sorted(set(re.findall(r"^diff --git a/(\S+) b/\S+\nnew file mode", patch, re.M)))
 
 
 def smoke_test(sb: Sandbox, task: Task) -> dict:

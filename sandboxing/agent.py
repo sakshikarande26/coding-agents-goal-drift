@@ -31,11 +31,16 @@ BAD_EXAMPLE = "find src -name '*.java' | grep -i builder"
 GOOD_EXAMPLE = "find . -name '*.py' | grep -i builder"
 
 
-def agent_config(cfg: Config) -> dict:
-    """mini-swe-agent's SWE-bench config with our prompt fix and step limit."""
+def swebench_config() -> dict:
+    """mini-swe-agent's own SWE-bench config file."""
     config_dir = os.path.join(os.path.dirname(minisweagent.__file__), "config")
     config_file = glob.glob(f"{config_dir}/**/swebench.yaml", recursive=True)[0]
-    agent_cfg = dict(yaml.safe_load(open(config_file)).get("agent", {}))
+    return yaml.safe_load(open(config_file))
+
+
+def agent_config(cfg: Config) -> dict:
+    """mini-swe-agent's SWE-bench config with our prompt fix and step limit."""
+    agent_cfg = dict(swebench_config().get("agent", {}))
     agent_cfg["step_limit"] = cfg.step_limit
     for key, value in agent_cfg.items():
         if isinstance(value, str) and BAD_EXAMPLE in value:
@@ -50,7 +55,12 @@ def make_model(cfg: Config, seed: int) -> LitellmModel:
     sampling = cfg.active_sampling
     top_k = sampling.pop("top_k", None)
     extra_body = {**({"top_k": top_k} if top_k is not None else {}), **cfg.chat_template_kwargs()}
+    # The SWE-bench config's model templates: long outputs are cut to the first and last 5,000 characters,
+    # and a response without a tool call gets guidance back. LitellmModel's defaults do neither.
+    templates = {k: v for k, v in swebench_config().get("model", {}).items()
+                 if k in ("observation_template", "format_error_template")}
     return LitellmModel(
+        **templates,
         model_name=f"hosted_vllm/{cfg.model}",
         cost_tracking="ignore_errors",  # local models have no price; avoids a crash
         model_kwargs={"api_base": cfg.server.url, **sampling, "seed": seed, "extra_body": extra_body},

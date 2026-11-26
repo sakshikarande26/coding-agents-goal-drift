@@ -68,6 +68,25 @@ def stop(proc: subprocess.Popen | None) -> None:
         proc.kill()
 
 
+def engine_info(cfg: Config) -> dict[str, str]:
+    """Which inference engine serves the model (vllm or llamacpp) and which weights file.
+    Runs from different engines sample differently, so every trajectory records it."""
+    url = cfg.server.url
+    try:
+        model = requests.get(f"{url}/models", timeout=10).json()["data"][0]
+        info = {"engine": str(model.get("owned_by", "unknown")), "served_model": str(model.get("id", "unknown")).rsplit("/", 1)[-1]}
+    except Exception as e:
+        return {"engine": f"unknown ({type(e).__name__})"}
+    if info["engine"] == "llamacpp":
+        try:  # llama-server reports its build at /props (outside /v1)
+            build = requests.get(url.rsplit("/v1", 1)[0] + "/props", timeout=10).json().get("build_info")
+            if build:
+                info["llamacpp_build"] = str(build)
+        except Exception:
+            pass
+    return info
+
+
 def ping(cfg: Config) -> str:
     """Ask the model one short question to check the server and the thinking switch."""
     reply = requests.post(f"{cfg.server.url}/chat/completions", json={

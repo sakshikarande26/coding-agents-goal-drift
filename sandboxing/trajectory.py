@@ -45,7 +45,7 @@ def finalize(traj: dict) -> dict:
             t[key] = versions[key]  # also top level, as in CONTEXT.md section 8
     t["versions"] = versions
 
-    for key in ("files_touched", "ref_patch_files"):
+    for key in ("files_touched", "files_created", "ref_patch_files"):
         if isinstance(t.get(key), list):
             t[key] = sorted(set(t[key]))
     if isinstance(t.get("messages"), list):
@@ -95,6 +95,7 @@ def drift_indicators(traj: dict) -> dict:
         if failed[i] and failed[i - 1] and steps[i]["command"] == steps[i - 1]["command"]
     )
     gold, edited = set(traj["ref_patch_files"]), set(traj["files_touched"])
+    edited -= set(traj.get("files_created", []))  # new scratch files are not edits outside the fix
     return {
         "traj_id": traj["traj_id"],
         "repo": traj["repo"],

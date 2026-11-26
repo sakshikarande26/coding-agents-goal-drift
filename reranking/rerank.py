@@ -1,10 +1,14 @@
 import copy, json, random, time, requests
 from dataclasses import dataclass, field, asdict
 
-BASH_TOOL = {"type": "function", "function": {
-    "name": "bash", "description": "Execute a bash command",
-    "parameters": {"type": "object", "properties": {"command": {"type": "string"}},
-                   "required": ["command"]}}}   # replace with the harness's real tool schema
+try:   # exact schema the rollouts used (mini-swe-agent 2.4.6)
+    from minisweagent.models.utils.actions_toolcall import BASH_TOOL
+except ImportError:   # fallback so the selftest and dry-run work where it isn't installed
+    BASH_TOOL = {"type": "function", "function": {
+        "name": "bash", "description": "Execute a bash command",
+        "parameters": {"type": "object",
+                       "properties": {"command": {"type": "string", "description": "The bash command to execute"}},
+                       "required": ["command"]}}}
 
 def commands_of(message):
     """All commands in an assistant message's tool calls, in order.

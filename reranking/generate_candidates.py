@@ -14,7 +14,7 @@ Outputs in --out (JSONL, appended, so a preempted job can be rerun and skips fin
   step_log.jsonl        tokens, wall time, finish reasons, prefix-cache deltas per prefix
   skipped.jsonl         prefixes that produced no pair, with the reason
 """
-import argparse, json, random, sys
+import argparse, hashlib, json, random, sys
 from collections import Counter
 from pathlib import Path
 
@@ -130,15 +130,28 @@ def run(args, sampler=rerank.rerank_step):
     sampling = dict(thinking=not args.no_thinking, temperature=args.temperature, top_p=args.top_p,
                     top_k=args.top_k, presence_penalty=args.presence_penalty, max_tokens=args.max_tokens)
     provenance = {"generator": "generate_candidates.py v0", "engine": "vllm", "model": args.model,
+                  "tool_schema_sha": hashlib.sha256(json.dumps(rerank.BASH_TOOL, sort_keys=True).encode()).hexdigest()[:12],
                   "n_requested": args.n, "sampling_seed": None, "gpu": args.gpu, **{
                       k: sampling[k] for k in ("thinking", "temperature", "top_p", "top_k", "presence_penalty", "max_tokens")}}
     stats = Counter()
+    bp = None
+    if args.branch_points:
+        bp = {}
+        for p in json.load(open(args.branch_points))["points"]:
+            bp.setdefault(p["traj_id"], []).append(p["branch_step"])
     for traj in load_trajectories(args.inputs):
         tid, messages = traj["traj_id"], traj["messages"]
         if traj.get("split") not in args.splits:
             stats["skipped_split"] += 1
             continue
-        for k in pick_prefixes(messages, args.per_traj, args.min_k, args.max_prompt_tokens):
+        if bp is not None:
+            if tid not in bp:
+                stats["skipped_not_in_branch_points"] += 1
+                continue
+            ks = sorted(bp[tid])
+        else:
+            ks = pick_prefixes(messages, args.per_traj, args.min_k, args.max_prompt_tokens)
+        for k in ks:
             set_id = f"{tid}:k{k}"
             if set_id in done:
                 stats["already_done"] += 1
@@ -190,6 +203,7 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--per-traj", type=int, default=2, help="prefixes per trajectory")
+    ap.add_argument("--branch-points", default=None, help="branch_points_pilot.json: use exactly these (traj_id, branch_step) prefixes")
     ap.add_argument("--pairs-per-set", type=int, default=1)
     ap.add_argument("--min-k", type=int, default=2, help="smallest prefix_len to use")
     ap.add_argument("--max-prompt-tokens", type=int, default=14000)

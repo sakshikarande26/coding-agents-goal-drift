@@ -54,6 +54,12 @@ def scrape_prefix_cache(url):
     except (requests.RequestException, ValueError):
         return {}
 
+def _with_reasoning_content(m):
+    """vLLM may name the parsed reasoning field 'reasoning'; the project schema uses 'reasoning_content'."""
+    if m.get("reasoning") and not m.get("reasoning_content"):
+        m = {**m, "reasoning_content": m["reasoning"]}
+    return m
+
 def sample_candidates(url, model, prefix, n, tools=(BASH_TOOL,), temperature=0.7, top_p=0.8,
                       top_k=20, presence_penalty=1.5, thinking=False, max_tokens=None,
                       seed=None, timeout=600):
@@ -62,7 +68,7 @@ def sample_candidates(url, model, prefix, n, tools=(BASH_TOOL,), temperature=0.7
     body = {"model": model, "messages": prefix, "tools": list(tools), "n": n,
             "temperature": temperature, "top_p": top_p, "top_k": top_k,
             "presence_penalty": presence_penalty,
-            "max_tokens": max_tokens or (2048 if thinking else 512),
+            "max_tokens": max_tokens or (4096 if thinking else 512),
             "chat_template_kwargs": {"enable_thinking": thinking}}
     if seed is not None:
         body["seed"] = seed
@@ -76,7 +82,7 @@ def sample_candidates(url, model, prefix, n, tools=(BASH_TOOL,), temperature=0.7
             "prompt_tokens": usage.get("prompt_tokens", 0),
             "completion_tokens": usage.get("completion_tokens", 0),
             "seconds": seconds}
-    return [c["message"] for c in data["choices"]], info
+    return [_with_reasoning_content(c["message"]) for c in data["choices"]], info
 
 @dataclass
 class StepLog:
@@ -155,13 +161,27 @@ def clean_messages(msgs):
         out.append(m)
     return out
 
+def completed_turn_ends(clean):
+    """Index just past each completed turn: an assistant message with tool calls plus all its tool results."""
+    ends, i = [], 0
+    while i < len(clean):
+        if clean[i]["role"] == "assistant" and clean[i].get("tool_calls"):
+            j = i + 1
+            while j < len(clean) and clean[j]["role"] == "tool":
+                j += 1
+            ends.append(j)
+            i = j
+        else:
+            i += 1
+    return ends
+
 def prefix_after_steps(clean, k):
-    """Messages up to the k-th tool result (k=0: before the first assistant turn)."""
-    first = next(i for i, m in enumerate(clean) if m["role"] == "assistant")
+    """Messages up to the end of the k-th completed turn (k=0: before the first assistant turn).
+    Later user messages (e.g. format-error notices) are not included; the real pair generator
+    should use data_eval.branching.shared_prefix with prefix_message_count instead."""
     if k == 0:
-        return clean[:first]
-    ends = [i + 1 for i, m in enumerate(clean) if m["role"] == "tool"]
-    return clean[:ends[k - 1]]
+        return clean[:next(i for i, m in enumerate(clean) if m["role"] == "assistant")]
+    return clean[:completed_turn_ends(clean)[k - 1]]
 
 def _fake(*cmds):
     return {"role": "assistant", "content": "",
@@ -190,20 +210,33 @@ def selftest():                              # no server needed
     before = json.dumps(raw)
     clean_messages(raw)
     assert json.dumps(raw) == before
+    # prefixes cut after ALL tool results of a multi-call turn
+    cl = [{"role": "system"}, {"role": "user"}, _fake("a", "b"), {"role": "tool"}, {"role": "tool"},
+          _fake("c"), {"role": "tool"}, {"role": "user"}]
+    assert completed_turn_ends(cl) == [5, 7] and len(prefix_after_steps(cl, 1)) == 5 and len(prefix_after_steps(cl, 0)) == 2
+    assert _with_reasoning_content({"role": "assistant", "reasoning": "x"})["reasoning_content"] == "x"
     print("selftest ok")
 
 if __name__ == "__main__":
     import sys
     selftest()
     if len(sys.argv) > 1:                    # python rerank.py traj.json  (needs a vLLM server)
-        URL, MODEL = "http://localhost:8000/v1", "Qwen/Qwen3-4B"
+        URL, MODEL = "http://localhost:8000/v1", "Qwen/Qwen3-8B"
+        # matches the cook_8b_v2 rollouts: thinking on, temp 0.6, top_p 0.95, top_k 20, presence_penalty 1.5
+        SAMPLING = dict(thinking=True, temperature=0.6, top_p=0.95, top_k=20, presence_penalty=1.5)
         clean = clean_messages(json.load(open(sys.argv[1]))["messages"])
-        for k, think in [(6, False), (6, True)]:
+        n_turns = len(completed_turn_ends(clean))
+        for k in (4, 10):
+            if k > n_turns:
+                print(f"step {k}: trajectory has only {n_turns} completed turns, skipping")
+                continue
             prefix = prefix_after_steps(clean, k)
-            _, log, _ = rerank_step(URL, MODEL, prefix, RepeatPenaltyScorer(), n=8,
-                                    thinking=think, track_cache=True)
-            write_log("rerank_log.jsonl", log, step=k, thinking=think)
-            print(f"step {k} thinking={think}: chosen {log.chosen_idx}, scores {log.scores}")
-            print(f"   {log.n_distinct} distinct, {log.completion_tokens} completion tokens in "
+            _, log, msgs = rerank_step(URL, MODEL, prefix, RepeatPenaltyScorer(), n=8,
+                                       track_cache=True, **SAMPLING)
+            write_log("rerank_log.jsonl", log, step=k, thinking=True)
+            print(f"step {k}: chosen {log.chosen_idx}, scores {log.scores}, finish {log.finish_reasons}")
+            print(f"   {log.n_distinct} distinct, prompt {log.prompt_tokens} tok, {log.completion_tokens} completion tokens in "
                   f"{log.sample_s:.1f}s ({log.completion_tok_per_s:.0f} tok/s), cache {log.cache}")
+            print("   message keys:", sorted(msgs[0].keys()), "| reasoning captured:",
+                  any(m.get("reasoning_content") for m in msgs))
             print("   picked:", log.candidates[log.chosen_idx])

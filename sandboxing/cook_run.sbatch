@@ -7,7 +7,7 @@
 #   sbatch --array=0-19 ~/coding-agents-goal-drift/sandboxing/cook_run.sbatch                                                  # full batch
 # Jobs stop at the 2-hour limit. Submit the same command again: saved trajectories are skipped.
 # Skip nodes with stuck GPU memory or a broken GPU (check first), e.g. sbatch --exclude=cook033,cook037 ...
-# Extra arguments are passed to `goal-drift run`.
+# Extra arguments are passed to `goal-drift run`. It runs the code in $REPO (python -m), not the installed copy.
 #
 #SBATCH --job-name=goal-drift
 #SBATCH --partition=gtx
@@ -58,4 +58,4 @@ nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader
 
 cd "$REPO"
 export PYTHONUNBUFFERED=1   # progress lines reach the job log right away
-goal-drift run --config "$CONFIG" --server-url "http://127.0.0.1:$PORT/v1" --shard "$SHARD/$SHARDS" "$@"
+python -m sandboxing.run run --config "$CONFIG" --server-url "http://127.0.0.1:$PORT/v1" --shard "$SHARD/$SHARDS" "$@"

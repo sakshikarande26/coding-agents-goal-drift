@@ -115,4 +115,4 @@ def drift_indicators(traj: dict) -> dict:
 
 def summarize(trajs_dir: Path) -> list[dict]:
     """Drift indicators for every trajectory JSON in the folder (printed, not saved)."""
-    return [drift_indicators(json.loads(p.read_text())) for p in sorted(trajs_dir.glob("*.json"))]
+    return [drift_indicators(json.loads(p.read_text())) for p in sorted(trajs_dir.glob("*.json")) if p.name != "manifest.json"]  # the validator writes manifest.json here

@@ -10,6 +10,8 @@ import subprocess
 import time
 from urllib.parse import urlparse
 
+import hashlib
+
 import requests
 
 from .config import Config
@@ -79,9 +81,11 @@ def engine_info(cfg: Config) -> dict[str, str]:
         return {"engine": f"unknown ({type(e).__name__})"}
     if info["engine"] == "llamacpp":
         try:  # llama-server reports its build at /props (outside /v1)
-            build = requests.get(url.rsplit("/v1", 1)[0] + "/props", timeout=10).json().get("build_info")
-            if build:
-                info["llamacpp_build"] = str(build)
+            props = requests.get(url.rsplit("/v1", 1)[0] + "/props", timeout=10).json()
+            if props.get("build_info"):
+                info["llamacpp_build"] = str(props["build_info"])
+            if props.get("chat_template"):  # the template in the GGUF, which llama-server really used
+                info["served_chat_template_hash"] = hashlib.sha256(props["chat_template"].encode()).hexdigest()[:16]
         except Exception:
             pass
     return info

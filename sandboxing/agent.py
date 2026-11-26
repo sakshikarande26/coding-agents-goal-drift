@@ -18,7 +18,7 @@ from minisweagent.exceptions import InterruptAgentFlow
 from minisweagent.models.litellm_model import LitellmModel
 
 from .config import Config
-from .sandbox import Sandbox, sh
+from .sandbox import PATHSPEC, Sandbox, sh
 
 litellm.suppress_debug_info = True
 
@@ -29,6 +29,7 @@ REPO_NOTE = (
 # The default example made the model copy `find src ...` 29 times in our first run.
 BAD_EXAMPLE = "find src -name '*.java' | grep -i builder"
 GOOD_EXAMPLE = "find . -name '*.py' | grep -i builder"
+DIFF_LIMIT = 20_000  # characters of the per-step diff kept in each step
 
 
 def swebench_config() -> dict:
@@ -51,6 +52,16 @@ def agent_config(cfg: Config) -> dict:
     return agent_cfg
 
 
+class HistoryModel(LitellmModel):
+    """Sends past assistant turns without their thinking text (Qwen's multi-turn advice), so prompts stay short
+    and any engine (llama.cpp or vLLM) sees the same history. agent.messages keeps the thinking for the saved file."""
+
+    def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
+        prepared = super()._prepare_messages_for_api(messages)
+        return [{k: v for k, v in m.items() if k != "reasoning_content"} if m.get("role") == "assistant" else m
+                for m in prepared]
+
+
 def make_model(cfg: Config, seed: int) -> LitellmModel:
     sampling = cfg.active_sampling
     top_k = sampling.pop("top_k", None)
@@ -59,7 +70,7 @@ def make_model(cfg: Config, seed: int) -> LitellmModel:
     # and a response without a tool call gets guidance back. LitellmModel's defaults do neither.
     templates = {k: v for k, v in swebench_config().get("model", {}).items()
                  if k in ("observation_template", "format_error_template")}
-    return LitellmModel(
+    return HistoryModel(
         **templates,
         model_name=f"hosted_vllm/{cfg.model}",
         cost_tracking="ignore_errors",  # local models have no price; avoids a crash
@@ -115,7 +126,19 @@ class SandboxEnvironment(LocalEnvironment):
 
         if self.max_repeats and self.streak >= self.max_repeats:
             self.stopped = True  # GuardedAgent ends the run after this step's output is recorded
+        if isinstance(result, dict):  # the code changes so far, saved in this step's tool message as extra.diff
+            result.setdefault("extra", {})["diff"] = self.diff()
         return result
+
+    def diff(self) -> str:
+        """All changes since the starting snapshot. Uses its own git index file,
+        so the agent's own `git status` and `git diff` output does not change."""
+        base = self.sandbox.base
+        out = self.sandbox.exec(
+            'export GIT_INDEX_FILE="$(git rev-parse --absolute-git-dir)/goal_drift_index"; '
+            f'[ -f "$GIT_INDEX_FILE" ] || git read-tree {base}; git add -A {PATHSPEC} 2>/dev/null; '
+            f"git diff --cached {base}", timeout=300)
+        return out if len(out) <= DIFF_LIMIT else out[:DIFF_LIMIT] + f"\n[diff cut at {DIFF_LIMIT} characters]"
 
 
 def _chat_template(model: str) -> str:

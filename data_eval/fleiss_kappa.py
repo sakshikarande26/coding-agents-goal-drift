@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Measure agreement among human annotators on preference pairs and drift labels.
+"""Fleiss' kappa for candidate-pair annotations (16-column format).
 
-Usage (from repository root):
-    python -m data_eval.fleiss_kappa examples/labeling/sample_annotations.csv \
-        --output-dir reports/labeling_pilot
+Run as a script:
+    python fleiss_kappa.py rater1.csv rater2.csv rater3.csv --output-dir reports/kappa
+Or from the repository root if this file lives in data_eval/:
+    python -m data_eval.fleiss_kappa rater1.csv rater2.csv rater3.csv --output-dir reports/kappa
 
-Requires Python 3.9+ and no third-party packages.
+Python 3.9+; Python standard library only.
 
-Expected CSV columns (one row per annotator per pair):
-    pair_id,annotator_id,preference,a_drift_types,b_drift_types
+Each row: pair_id, annotator_id, preference (A/B/tie/uncertain), 6 a_* drift
+columns and 6 b_* drift columns (yes/no/uncertain). An optional notes
+column and any other metadata columns are ignored by the statistic.
 
-The A/B names are fixed candidate identities, NOT chosen/rejected labels.
-Three annotators independently assess the same pairs (default --num-raters 3).
+The same, fixed A/B candidate identities are used for all drift labels.
+The agreed labeling rules govern HUMAN decisions, not a transformation of
+labels in this analysis script. Preference and six drift ratings are
+independent. Unknown and blank values cannot silently become 'no'.
 """
 from __future__ import annotations
 
@@ -33,248 +37,292 @@ DRIFT_TYPES = (
     "skipped_requirement",
 )
 PREFERENCES = ("A", "B", "tie")
-REQUIRED_COLUMNS = (
-    "pair_id",
-    "annotator_id",
-    "preference",
-    "a_drift_types",
-    "b_drift_types",
-)
+DRIFT_COLUMNS = tuple(f"{p}_{label}" for p in ("a", "b") for label in DRIFT_TYPES)
+LABEL_COLUMNS = ("preference",) + DRIFT_COLUMNS
+REQUIRED_COLUMNS = ("pair_id", "annotator_id") + LABEL_COLUMNS
 
 
 class AnnotationError(ValueError):
-    """Bad annotation input that should be corrected, not silently ignored."""
+    """Input problems requiring correction rather than silent reinterpretation."""
 
 
-def parse_drift_types(value: str, *, location: str) -> frozenset[str] | None:
-    """Return a set of drift labels, empty set for 'none', None for 'uncertain'.
-
-    Multi-label entries can use semicolon or vertical-bar separators. None and
-    uncertain must occur alone; empty cells are never implicitly 'none'.
-    """
-    if not isinstance(value, str) or not value.strip():
-        raise AnnotationError(f"{location}: drift label is empty; use none or uncertain explicitly")
-    text = value.strip().lower().replace("|", ";")
-    parts = [part.strip() for part in text.split(";")]
-    if any(not part for part in parts):
-        raise AnnotationError(f"{location}: empty label between separators")
-    if len(parts) != len(set(parts)):
-        raise AnnotationError(f"{location}: duplicate drift label")
-    allowed = set(DRIFT_TYPES) | {"none", "uncertain"}
-    unknown = sorted(set(parts) - allowed)
-    if unknown:
-        raise AnnotationError(f"{location}: unknown drift label(s): {', '.join(unknown)}")
-    if len(parts) > 1 and ("none" in parts or "uncertain" in parts):
-        raise AnnotationError(f"{location}: none/uncertain cannot coexist with another label")
-    if parts == ["uncertain"]:
-        return None
-    if parts == ["none"]:
-        return frozenset()
-    return frozenset(parts)
+def parse_preference(value: str, *, location: str) -> str:
+    val = (value or "").strip()
+    if val.upper() in ("A", "B"):
+        return val.upper()
+    if val.lower() in ("tie", "uncertain"):
+        return val.lower()
+    raise AnnotationError(f"{location}: preference {val!r} must be A, B, tie, or uncertain")
 
 
-def load_annotations(paths: Path | Sequence[Path], *, num_raters: int = 3) -> dict[str, dict[str, dict[str, Any]]]:
-    """Read and validate a complete independent-labeling CSV.
+def parse_drift(value: str, *, location: str) -> str:
+    val = (value or "").strip().lower()
+    mapping = {
+        "yes": "yes", "y": "yes", "true": "yes", "1": "yes",
+        "no": "no", "n": "no", "false": "no", "0": "no",
+        "uncertain": "uncertain",
+    }
+    if val not in mapping:
+        raise AnnotationError(f"{location}: drift {val!r} must be yes, no, or uncertain (1/0 and true/false accepted)")
+    return mapping[val]
 
-    Every pair must have the same num_raters annotators, and the set of IDs must
-    be identical for every pair. Uncertain ratings are permitted but explicit.
+
+def load_annotations(
+    paths: Path | Sequence[Path], *, num_raters: int = 3,
+    allow_incomplete: bool = False, audit: dict[str, Any] | None = None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Load independently labeled pair items, grouping by stable pair_id.
+
+    Default is strict: every pair needs all num_raters, and no empty labels.
+    When allow_incomplete=True, entirely empty placeholder rows are ignored;
+    pairs lacking all raters are excluded. Partially filled rows always error.
+    Uncertain is an explicit label, not a blank or a placeholder.
     """
     if num_raters < 2:
         raise AnnotationError("num_raters must be at least 2")
-    grouped: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
-    if isinstance(paths, Path):
-        paths = [paths]
+    if isinstance(paths, (str, Path)):
+        paths = [Path(paths)]
+    paths = [Path(path) for path in paths]
     if not paths:
         raise AnnotationError("Provide at least one CSV file")
+    all_pairs: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    seen: set[tuple[str, str]] = set()
+    blank_rows: list[str] = []
     for path in paths:
         try:
             with path.open("r", newline="", encoding="utf-8-sig") as handle:
                 reader = csv.DictReader(handle)
                 if not reader.fieldnames:
-                    raise AnnotationError("CSV is empty or has no header")
+                    raise AnnotationError(f"{path}: CSV has no header")
                 fields = [name.strip() for name in reader.fieldnames]
                 if len(fields) != len(set(fields)):
-                    raise AnnotationError("CSV has duplicate column names")
-                missing = set(REQUIRED_COLUMNS) - set(fields)
+                    raise AnnotationError(f"{path}: duplicate header column names")
+                missing = sorted(set(REQUIRED_COLUMNS) - set(fields))
                 if missing:
-                    raise AnnotationError("CSV missing columns: " + ", ".join(sorted(missing)))
-                for line_number, row in enumerate(reader, start=2):
-                    if None in row:
-                        raise AnnotationError(f"row {line_number}: too many CSV fields; quote commas within values")
-                    # Match trimmed header labels (without discarding extra metadata columns).
-                    row = {key.strip(): val for key, val in row.items()}
-                    pair_id = (row["pair_id"] or "").strip()
-                    annotator_id = (row["annotator_id"] or "").strip()
-                    if not pair_id or not annotator_id:
-                        raise AnnotationError(f"row {line_number}: pair_id and annotator_id are required")
-                    if annotator_id in grouped[pair_id]:
-                        raise AnnotationError(f"row {line_number}: duplicate annotation for pair {pair_id!r}, annotator {annotator_id!r}")
-                    pref = (row["preference"] or "").strip()
-                    if pref.lower() == "uncertain":
-                        pref = "uncertain"
-                    elif pref.upper() in ("A", "B"):
-                        pref = pref.upper()
-                    elif pref.lower() == "tie":
-                        pref = "tie"
-                    else:
-                        raise AnnotationError(
-                            f"row {line_number}: preference {pref!r} must be A, B, tie, or uncertain"
-                        )
-                    grouped[pair_id][annotator_id] = {
-                        "preference": pref,
-                        "A": parse_drift_types(row["a_drift_types"], location=f"row {line_number} a_drift_types"),
-                        "B": parse_drift_types(row["b_drift_types"], location=f"row {line_number} b_drift_types"),
+                    raise AnnotationError(f"{path}: CSV missing columns: {', '.join(missing)}")
+                for line_number, raw in enumerate(reader, start=2):
+                    location = f"{path}:{line_number}"
+                    if None in raw:
+                        raise AnnotationError(f"{location}: too many comma-separated fields")
+                    row = {(key or "").strip(): value for key, value in raw.items()}
+                    pair = (row["pair_id"] or "").strip()
+                    rater = (row["annotator_id"] or "").strip()
+                    if not pair or not rater:
+                        raise AnnotationError(f"{location}: pair_id and annotator_id must be nonempty")
+                    key = (pair, rater)
+                    if key in seen:
+                        raise AnnotationError(f"{location}: duplicate annotation for pair {pair!r}, annotator {rater!r}")
+                    seen.add(key)
+                    all_pairs.setdefault(pair, {})
+                    empties = [col for col in LABEL_COLUMNS if not (row[col] or "").strip()]
+                    if empties:
+                        if allow_incomplete and len(empties) == len(LABEL_COLUMNS):
+                            blank_rows.append(f"{pair}:{rater}")
+                            continue
+                        if len(empties) == len(LABEL_COLUMNS):
+                            raise AnnotationError(
+                                f"{location}: completely unlabeled placeholder row; "
+                                "complete it or use --allow-incomplete to exclude it"
+                            )
+                        raise AnnotationError(f"{location}: partially labeled row: empty {', '.join(empties)}; "
+                                              "enter yes/no/uncertain explicitly")
+                    all_pairs[pair][rater] = {
+                        "preference": parse_preference(row["preference"], location=f"{location} preference"),
+                        "A": {label: parse_drift(row[f"a_{label}"], location=f"{location} a_{label}")
+                              for label in DRIFT_TYPES},
+                        "B": {label: parse_drift(row[f"b_{label}"], location=f"{location} b_{label}")
+                              for label in DRIFT_TYPES},
                     }
         except (OSError, UnicodeError, csv.Error) as exc:
-            raise AnnotationError(f"Cannot read annotations CSV {path}: {exc}") from exc
-    if not grouped:
-        raise AnnotationError("No annotations found")
+            raise AnnotationError(f"Cannot read {path}: {exc}") from exc
+
+    if not seen:
+        raise AnnotationError("No annotation rows found")
+    eligible: dict[str, dict[str, dict[str, Any]]] = {}
+    excluded: list[str] = []
     canonical_raters: set[str] | None = None
-    for pair_id, responses in sorted(grouped.items()):
+    for pair, responses in sorted(all_pairs.items()):
         raters = set(responses)
         if len(raters) != num_raters:
-            raise AnnotationError(
-                f"pair {pair_id!r} has {len(raters)} distinct annotator(s); expected {num_raters}"
-            )
+            if not allow_incomplete:
+                raise AnnotationError(f"pair {pair!r}: found {len(raters)} annotators, expected {num_raters}")
+            excluded.append(pair)
+            continue
         if canonical_raters is None:
             canonical_raters = raters
         elif raters != canonical_raters:
             raise AnnotationError(
-                f"pair {pair_id!r}: different annotators; all pairs must be labeled by the same team"
+                f"pair {pair!r}: annotator set differs from other complete pairs; "
+                "same annotators must label every eligible pair"
             )
-    return dict(grouped)
+        eligible[pair] = responses
+    if not eligible:
+        raise AnnotationError(
+            f"No pairs have all {num_raters} annotators; "
+            "provide additional reviewers or change --num-raters for a diagnostic run"
+        )
+    if audit is not None:
+        audit.clear()
+        audit.update({
+            "source_pairs": len(all_pairs),
+            "source_csv_files": [str(p) for p in paths],
+            "blank_placeholder_rows_ignored": len(blank_rows),
+            "blank_placeholder_ids": sorted(blank_rows),
+            "pairs_excluded_for_missing_raters": len(excluded),
+            "excluded_incomplete_pair_ids": excluded,
+            "allow_incomplete": allow_incomplete,
+        })
+    return eligible
 
 
-def fleiss_kappa(units: Sequence[Sequence[str]], categories: Sequence[str], *, num_raters: int) -> dict[str, Any]:
-    """Compute standard, nominal, fixed-rater-count Fleiss' kappa.
+def fleiss_kappa(
+    units: Sequence[Sequence[str]], categories: Sequence[str], *, num_raters: int,
+) -> dict[str, Any]:
+    """Standard unweighted nominal Fleiss' kappa for fixed n raters/item.
 
-    Units are independently rated items. Categories are mutually exclusive for
-    THIS metric. Multi-label drift is evaluated as six separate binary metrics.
-    Uncertain items must be excluded by caller (only complete units passed).
+    All uncertain-containing units must be removed before this function.
+    It also operates for n=2 (diagnostic only; n=3 for the intended pilot).
     """
-    category_set = set(categories)
+    if num_raters < 2:
+        raise ValueError("num_raters must be >= 2")
+    if len(categories) < 2 or len(set(categories)) != len(categories):
+        raise ValueError("At least two unique categories are required")
     if not units:
         return {
-            "items": 0,
-            "raters_per_item": num_raters,
-            "kappa": None,
-            "observed_agreement": None,
-            "chance_agreement": None,
+            "items": 0, "raters_per_item": num_raters, "kappa": None,
+            "observed_agreement": None, "chance_agreement": None,
             "unanimous_fraction": None,
-            "category_prevalence": {c: None for c in categories},
-            "undefined_reason": "No completely labeled items for this metric",
+            "category_prevalence": {category: None for category in categories},
+            "undefined_reason": "No eligible fully rated items",
         }
-    if len(categories) < 2 or len(category_set) != len(categories):
-        raise ValueError("At least two unique categories are required")
-    total_counts: Counter[str] = Counter()
-    observed_sum = 0.0
+    counts_all: Counter[str] = Counter()
+    agreement_sum = 0.0
     unanimous = 0
+    allowed = set(categories)
     for idx, ratings in enumerate(units):
         if len(ratings) != num_raters:
-            raise ValueError(f"item {idx}: expected {num_raters} ratings, found {len(ratings)}")
-        if any(label not in category_set for label in ratings):
-            raise ValueError(f"item {idx}: unknown rating")
+            raise ValueError(f"item {idx}: expected {num_raters} ratings, got {len(ratings)}")
+        if any(val not in allowed for val in ratings):
+            raise ValueError(f"item {idx}: unknown category")
         counts = Counter(ratings)
-        total_counts.update(counts)
-        observed_sum += sum(n * (n - 1) for n in counts.values()) / (num_raters * (num_raters - 1))
-        if max(counts.values()) == num_raters:
-            unanimous += 1
+        counts_all.update(counts)
+        agreement_sum += sum(n * (n - 1) for n in counts.values()) / (num_raters * (num_raters - 1))
+        unanimous += int(max(counts.values()) == num_raters)
     n_items = len(units)
-    prevalence = {c: total_counts[c] / (n_items * num_raters) for c in categories}
-    p_observed = observed_sum / n_items
-    p_chance = sum(p * p for p in prevalence.values())
-    if abs(1.0 - p_chance) < 1e-12:
+    prevalence = {c: counts_all[c] / (n_items * num_raters) for c in categories}
+    observed = agreement_sum / n_items
+    chance = sum(p * p for p in prevalence.values())
+    if abs(1.0 - chance) < 1e-12:
         kappa = None
-        reason = "All ratings use one category; chance agreement is 100%, so kappa is undefined"
+        reason = "All eligible ratings use one category; kappa is mathematically undefined"
     else:
-        kappa = (p_observed - p_chance) / (1.0 - p_chance)
+        kappa = (observed - chance) / (1.0 - chance)
         reason = None
     return {
         "items": n_items,
         "raters_per_item": num_raters,
         "kappa": kappa,
-        "observed_agreement": p_observed,
-        "chance_agreement": p_chance,
+        "observed_agreement": observed,
+        "chance_agreement": chance,
         "unanimous_fraction": unanimous / n_items,
         "category_prevalence": prevalence,
         "undefined_reason": reason,
     }
 
 
-def _detail_row(pair_id: str, dimension: str, raters: list[str], values: list[str]) -> dict[str, str]:
-    c = Counter(values)
-    majority, freq = c.most_common(1)[0]
+def _detail_row(pair_id: str, dimension: str, raters: list[str], votes: list[str]) -> dict[str, str]:
+    counts = Counter(votes)
+    majority, count = counts.most_common(1)[0]
     return {
         "pair_id": pair_id,
         "dimension": dimension,
-        "ratings": "; ".join(f"{r}:{v}" for r, v in zip(raters, values)),
-        "majority_label": majority if freq > len(values) // 2 and majority != "uncertain" else "",
-        "has_uncertain": "yes" if "uncertain" in values else "no",
+        "ratings": "; ".join(f"{r}:{v}" for r, v in zip(raters, votes)),
+        "majority_label": majority if count > len(votes) // 2 and majority != "uncertain" else "",
+        "has_uncertain": "yes" if "uncertain" in votes else "no",
     }
 
 
-def analyze_annotations(grouped: dict[str, dict[str, dict[str, Any]]], *, num_raters: int = 3) -> tuple[dict[str, Any], list[dict[str, str]]]:
-    """Return machine-readable agreement summary and rows needing discussion."""
+def analyze_annotations(
+    grouped: dict[str, dict[str, dict[str, Any]]], *, num_raters: int = 3,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Summarize preference and per-drift-type kappa, plus review disagreements.
+
+    Each (pair_id, candidate A/B) is an independent binary observation.
+    A category is excluded only when a rater is uncertain about THAT category.
+    any_drift requires all six categories for all raters to be known.
+    """
     preference_units: list[list[str]] = []
-    binary_units: dict[str, list[list[str]]] = {label: [] for label in (*DRIFT_TYPES, "any_drift")}
-    skip_prefs: list[str] = []
-    skip_candidates: list[str] = []
+    drift_units: dict[str, list[list[str]]] = {name: [] for name in (*DRIFT_TYPES, "any_drift")}
+    excluded_pref: list[str] = []
+    excluded_by_category: dict[str, list[str]] = {name: [] for name in (*DRIFT_TYPES, "any_drift")}
     disputes: list[dict[str, str]] = []
-    total_candidate_units = 0
+    num_candidates = 0
     for pair_id, responses in sorted(grouped.items()):
         raters = sorted(responses)
         if len(raters) != num_raters:
             raise AnnotationError(f"pair {pair_id!r}: expected {num_raters} raters")
         prefs = [responses[r]["preference"] for r in raters]
         if "uncertain" in prefs:
-            skip_prefs.append(pair_id)
+            excluded_pref.append(pair_id)
         else:
             preference_units.append(prefs)
         if len(set(prefs)) != 1 or "uncertain" in prefs:
             disputes.append(_detail_row(pair_id, "preference", raters, prefs))
         for candidate in ("A", "B"):
-            total_candidate_units += 1
-            labels = [responses[r][candidate] for r in raters]
-            if any(label is None for label in labels):
-                skip_candidates.append(f"{pair_id}:{candidate}")
-                # Show the skipped item even if all raters said uncertain.
-                disputes.append(_detail_row(pair_id, f"{candidate}:drift_label_status", raters,
-                                            ["uncertain" if label is None else "labeled" for label in labels]))
-                continue
+            num_candidates += 1
+            candidate_id = f"{pair_id}:{candidate}"
             for drift_type in DRIFT_TYPES:
-                votes = ["yes" if drift_type in lab else "no" for lab in labels]
-                binary_units[drift_type].append(votes)
-                if len(set(votes)) != 1:
+                votes = [responses[r][candidate][drift_type] for r in raters]
+                if "uncertain" in votes:
+                    excluded_by_category[drift_type].append(candidate_id)
+                else:
+                    drift_units[drift_type].append(votes)
+                if len(set(votes)) != 1 or "uncertain" in votes:
                     disputes.append(_detail_row(pair_id, f"{candidate}:{drift_type}", raters, votes))
-            votes = ["yes" if lab else "no" for lab in labels]
-            binary_units["any_drift"].append(votes)
-            if len(set(votes)) != 1:
-                disputes.append(_detail_row(pair_id, f"{candidate}:any_drift", raters, votes))
+            all_known = all(
+                responses[r][candidate][type_name] != "uncertain"
+                for r in raters for type_name in DRIFT_TYPES
+            )
+            if not all_known:
+                excluded_by_category["any_drift"].append(candidate_id)
+            else:
+                votes = ["yes" if any(responses[r][candidate][typ] == "yes" for typ in DRIFT_TYPES)
+                         else "no" for r in raters]
+                drift_units["any_drift"].append(votes)
+                if len(set(votes)) != 1:
+                    disputes.append(_detail_row(pair_id, f"{candidate}:any_drift", raters, votes))
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "num_pairs": len(grouped),
-        "num_candidate_actions": total_candidate_units,
+        "num_candidate_actions": num_candidates,
         "num_raters": num_raters,
         "annotator_ids": sorted(next(iter(grouped.values())).keys()),
         "preference": {
             **fleiss_kappa(preference_units, PREFERENCES, num_raters=num_raters),
-            "excluded_pair_ids": skip_prefs,
+            "excluded_pair_ids": excluded_pref,
+            "excluded_count": len(excluded_pref),
         },
         "drift": {
-            label: fleiss_kappa(binary_units[label], ("no", "yes"), num_raters=num_raters)
-            for label in (*DRIFT_TYPES, "any_drift")
+            typ: {
+                **fleiss_kappa(drift_units[typ], ("no", "yes"), num_raters=num_raters),
+                "excluded_count": len(excluded_by_category[typ]),
+                "excluded_candidate_ids": excluded_by_category[typ],
+            } for typ in (*DRIFT_TYPES, "any_drift")
         },
-        "excluded_candidate_ids_for_drift": skip_candidates,
-        "items_requiring_review": len({row["pair_id"] for row in disputes}),
+        "excluded_candidate_ids_by_drift": excluded_by_category,
+        "excluded_candidate_ids_for_drift": excluded_by_category["any_drift"],
+        "items_requiring_review": len({r["pair_id"] for r in disputes}),
         "disagreement_rows": len(disputes),
         "notes": [
-            "A and B are fixed candidate identities, not chosen/rejected labels.",
-            "Preference is nominal A, B, or tie; uncertain is excluded from preference kappa.",
-            "Drift is multi-label, evaluated as six separate yes/no kappas on candidate actions.",
-            "An uncertain drift rating excludes that candidate from ALL drift metrics; never treat it as none.",
-            "any_drift means at least one of the six drift labels; it does not measure correctness.",
-            "Undefined kappa (null) means no eligible items or zero category variation; consult observed agreement.",
-            "Disagreements and majority votes are diagnostics, not finalized gold labels; adjudicate separately.",
+            "A/B identify fixed candidate actions, independent of the preference selection.",
+            "Preference kappa uses A/B/tie; excludes pairs with ANY uncertain preference.",
+            "Each of six binary drift kappas is calculated over A+B candidate actions independently.",
+            "Uncertainty excludes only that candidate/category observation from that category's kappa.",
+            "any_drift is a stricter optional diagnostic, excluding candidates with ANY uncertain category.",
+            "Missing cells are never interpreted as no; blank placeholders are only skipped by explicit flag.",
+            "No automatic loop, hardcode, or skipped_requirement inference is performed: human rubric controls labels.",
+            "Kappa measures independent rater agreement; majority shown in review report is NOT an adjudication.",
+            "Null kappa indicates no eligible items or no prevalence variation; see raw agreement and reason.",
         ],
     }
     return report, disputes
@@ -283,42 +331,51 @@ def analyze_annotations(grouped: dict[str, dict[str, dict[str, Any]]], *, num_ra
 def save_results(report: dict[str, Any], disputes: list[dict[str, str]], out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     (out / "kappa_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    with (out / "review_disagreements.csv").open("w", newline="", encoding="utf-8") as handle:
+    with (out / "review_disagreements.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["pair_id", "dimension", "ratings", "majority_label", "has_uncertain"])
         writer.writeheader()
         writer.writerows(disputes)
 
 
-def _fmt(v: float | None) -> str:
-    return "undefined" if v is None else f"{v:.3f}"
+def _fmt(value: float | None) -> str:
+    return "undefined" if value is None else f"{value:.3f}"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("annotations", type=Path, nargs="+", help="One combined CSV or separate CSVs from each human annotator")
-    parser.add_argument("--output-dir", type=Path, default=Path("reports/kappa"), help="Where to save report and disagreements CSV")
-    parser.add_argument("--num-raters", type=int, default=3, help="Expected fixed annotator count (default 3)")
+    parser.add_argument("annotations", type=Path, nargs="+", help="Separate reviewer CSV files or one combined CSV")
+    parser.add_argument("--output-dir", type=Path, default=Path("reports/kappa"))
+    parser.add_argument("--num-raters", type=int, default=3, help="Expected number of independent annotators (default: 3)")
+    parser.add_argument("--allow-incomplete", action="store_true",
+                        help="For a diagnostic run, ignore wholly blank placeholder rows and pairs missing reviewers")
     args = parser.parse_args(argv)
     try:
-        grouped = load_annotations(args.annotations, num_raters=args.num_raters)
+        audit: dict[str, Any] = {}
+        grouped = load_annotations(args.annotations, num_raters=args.num_raters,
+                                   allow_incomplete=args.allow_incomplete, audit=audit)
         report, disputes = analyze_annotations(grouped, num_raters=args.num_raters)
+        report["input_validation"] = audit
         save_results(report, disputes, args.output_dir)
-    except (AnnotationError, OSError) as exc:
+    except (AnnotationError, OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    print(f"Loaded {report['num_pairs']} pairs, {report['num_raters']} raters, {report['num_candidate_actions']} candidate actions")
+    print(f"Analyzed {report['num_pairs']} pairs ({audit['source_pairs']} in CSVs), "
+          f"{report['num_raters']} reviewers, {report['num_candidate_actions']} candidate actions")
+    if audit["pairs_excluded_for_missing_raters"]:
+        print(f"Excluded {audit['pairs_excluded_for_missing_raters']} incomplete pairs; "
+              f"ignored {audit['blank_placeholder_rows_ignored']} entirely blank rows")
     pref = report["preference"]
-    print(f"Preference (A/B/tie): Fleiss kappa {_fmt(pref['kappa'])}; "+
-          f"raw agreement {_fmt(pref['observed_agreement'])}; eligible pairs {pref['items']}/{report['num_pairs']}")
-    print("Drift (each candidate labeled yes/no for each type):")
-    for label, metric in report["drift"].items():
-        print(f"  {label:22s} kappa={_fmt(metric['kappa']):>9s}  "+
-              f"agreement={_fmt(metric['observed_agreement']):>9s}  items={metric['items']}")
-    if pref["excluded_pair_ids"] or report["excluded_candidate_ids_for_drift"]:
-        print(f"Excluded for uncertain: {len(pref['excluded_pair_ids'])} preference pairs, "+
-              f"{len(report['excluded_candidate_ids_for_drift'])} candidate actions")
-    print(f"Items needing review: {report['items_requiring_review']} pair(s); {len(disputes)} disagreement/uncertainty rows")
-    print(f"Saved {args.output_dir / 'kappa_report.json'} and {args.output_dir / 'review_disagreements.csv'}")
+    print(f"Preference A/B/tie: kappa={_fmt(pref['kappa'])}, agreement={_fmt(pref['observed_agreement'])}, "
+          f"eligible={pref['items']}/{report['num_pairs']}, excluded_uncertain={pref['excluded_count']}")
+    print("Drift: binary yes/no per candidate, category-specific uncertain exclusions:")
+    for typ, metric in report["drift"].items():
+        print(f"  {typ:21s} kappa={_fmt(metric['kappa']):>9s} "
+              f"agreement={_fmt(metric['observed_agreement']):>9s} "
+              f"eligible={metric['items']:>3d}/{report['num_candidate_actions']:<3d} "
+              f"excluded_uncertain={metric['excluded_count']}")
+    print(f"Review needed: {report['items_requiring_review']} distinct pairs; {len(disputes)} issue rows")
+    print(f"Saved {args.output_dir / 'kappa_report.json'} and "
+          f"{args.output_dir / 'review_disagreements.csv'}")
     return 0
 
 
